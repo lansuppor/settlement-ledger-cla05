@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额，以及退款单的登记、读取、审核（同意/拒绝）与冲正（撤销）；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额，订单的 CSV 批量受理（逐行校验、部分成功、重放幂等与中断续跑），以及退款单的登记、读取、审核（同意/拒绝）与冲正（撤销）；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -23,6 +23,21 @@
 - `GET /orders/{order_id}`：按标识读取订单。租户通过请求头 `X-Tenant` 传入；不存在返回 404；跨租户读取返回 404（不泄漏对象是否存在）。
 - `POST /orders/{order_id}/payments`：登记收款。请求字段 `amount_cents`；超过未收金额返回 409；成功返回 200 与订单的 `paid_cents`、`outstanding_cents`。
 - `GET /health`：返回服务与数据库状态。
+
+### 批量受理
+
+- `POST /batches`：批量受理订单，以（租户, `batch_id`）为批次业务身份。请求体支持两种形式：
+  - JSON：`{"tenant":..., "batch_id":..., "csv":"<CSV 文本>"}`（`Content-Type: application/json`）；
+  - CSV 原文：`Content-Type: text/csv`，`tenant`、`batch_id` 通过查询参数传入，如 `POST /batches?tenant=t1&batch_id=B1`。
+
+  CSV 首行必须为表头 `tenant,order_id,amount_cents,currency`，其后每行为一笔订单，字段含义与 `POST /orders` 一致。成功首次受理返回 201；同一（租户, `batch_id`）重放不新建批次、不重复受理任何订单，返回既有结果（200），行内容不同也不新建批次。
+- `GET /batches/{batch_id}`：按批次标识查询批次结果。租户通过请求头 `X-Tenant` 传入；不存在或跨租户一律返回 404（不泄漏批次是否存在）。
+
+批次结果字段：
+
+- `batch_id`、`status`、`total`（数据行总数）、`success_count`、`failure_count`、`errors`（错误清单）、`accepted_order_ids`（本批次成功受理的订单标识列表）。
+- `status` 取值：`in_progress`（处理中/中断）、`completed`（全部成功）、`completed_with_errors`（有失败行但已处理完）。恒有 `success_count + failure_count = total`。
+- `errors` 每项含 `line_no`（从 1 计、含表头行，故首条数据行为 2）、`code`、`message`。`code` 区分参数错误 `invalid_param` 与订单冲突 `order_conflict`。
 
 ### 退款单
 
@@ -62,4 +77,16 @@ curl -s -X POST http://127.0.0.1:8000/refunds/rf-1/review \
 
 # 冲正：把已生效退款全额退回订单
 curl -s -X POST http://127.0.0.1:8000/refunds/rf-1/reverse -H 'X-Tenant: t1'
+
+# 批量受理（JSON 内嵌 CSV 文本；同一 batch_id 重放返回既有结果，不重复受理）
+curl -s -X POST http://127.0.0.1:8000/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant":"t1","batch_id":"b-20261001","csv":"tenant,order_id,amount_cents,currency\nt1,b1,1200,CNY\nt1,b2,800,CNY\n"}'
+
+# 批量受理（直接上传 CSV 文件；fixtures/orders.csv 内 t2 行会按租户不一致计入错误清单）
+curl -s -X POST 'http://127.0.0.1:8000/batches?tenant=t1&batch_id=b-file' \
+  -H 'Content-Type: text/csv' --data-binary @fixtures/orders.csv
+
+# 查询批次结果（查询需 X-Tenant 头；跨租户返回 404）
+curl -s http://127.0.0.1:8000/batches/b-20261001 -H 'X-Tenant: t1'
 ```

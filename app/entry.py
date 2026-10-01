@@ -5,7 +5,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import orders, refunds
+from app.store import batches, orders, refunds
 from app.store.db import connect, migrate
 from app.store.refunds import ConflictError, OrderNotFound
 
@@ -82,6 +82,52 @@ def _non_empty_str(value) -> bool:
 def _positive_int(value) -> bool:
     # 排除 bool：True/False 在 Python 中是 int 子类，不是合法金额。
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+@app.post("/batches", status_code=201)
+async def create_batch(request: Request, response: Response) -> dict:
+    """批量受理订单。支持两种提交方式：
+
+    - JSON：{"tenant","batch_id","csv"}，csv 为 CSV 文本；
+    - text/csv 原始请求体：tenant、batch_id 通过查询参数传入。
+    批次以（租户, batch_id）为业务身份；重放不重复受理，只返回既有结果。
+    """
+    content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if content_type == "text/csv":
+        tenant = request.query_params.get("tenant", "")
+        batch_id = request.query_params.get("batch_id", "")
+        raw = await request.body()
+        try:
+            csv_text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400, detail="invalid CSV encoding: expected UTF-8")
+    else:
+        body = await _json_body(request)
+        tenant = body.get("tenant")
+        batch_id = body.get("batch_id")
+        csv_text = body.get("csv")
+        if not (_non_empty_str(tenant) and _non_empty_str(batch_id)):
+            raise HTTPException(status_code=400, detail="tenant and batch_id are required")
+        if not isinstance(csv_text, str):
+            raise HTTPException(status_code=400, detail="csv text is required")
+    try:
+        result, existed = batches.process(tenant, batch_id, csv_text)
+    except batches.CSVFormatError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    if existed:
+        # 同一批次身份重放：不新建批次、不重复受理，返回既有结果（HTTP 200）。
+        response.status_code = 200
+    return result
+
+
+@app.get("/batches/{batch_id}")
+def read_batch(batch_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    result = batches.get_result(tenant, batch_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="batch not found")
+    return result
+
 
 @app.post("/refunds", status_code=201)
 async def register_refund(request: Request, response: Response) -> dict:
