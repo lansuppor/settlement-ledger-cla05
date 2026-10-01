@@ -1,5 +1,6 @@
-import sqlite3
 from app.store.db import connect
+from app.store.refunds import net_approved
+
 
 def insert(tenant: str, order_id: str, amount_cents: int, currency: str) -> None:
     conn = connect()
@@ -22,8 +23,10 @@ def get(tenant: str, order_id: str) -> dict | None:
         conn.close()
     if row is None:
         return None
-    outstanding = row["amount_cents"] - row["paid_cents"]
-    return {**dict(row), "outstanding_cents": outstanding}
+    # paid_cents 为累计收款毛额；对外已收金额需扣除已生效（批准且未冲正）的退款。
+    gross_paid = row["paid_cents"]
+    net_paid = gross_paid - net_approved(tenant, order_id)
+    return {**dict(row), "paid_cents": net_paid, "outstanding_cents": row["amount_cents"] - net_paid}
 
 def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
     conn = connect()
@@ -36,14 +39,26 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
         if row is None:
             conn.execute("ROLLBACK")
             return None
-        if amount_cents <= 0 or row["paid_cents"] + amount_cents > row["amount_cents"]:
+        refunded = conn.execute(
+            "SELECT COALESCE(SUM(amount_cents),0) AS total FROM refunds "
+            "WHERE tenant=? AND order_id=? AND status='approved'",
+            (tenant, order_id),
+        ).fetchone()["total"]
+        net_paid = row["paid_cents"] - refunded
+        if amount_cents <= 0 or net_paid + amount_cents > row["amount_cents"]:
             conn.execute("ROLLBACK")
             raise ValueError("payment exceeds outstanding amount")
+        new_gross = row["paid_cents"] + amount_cents
+        new_status = "settled" if new_gross - refunded >= row["amount_cents"] else "accepted"
         conn.execute(
-            "UPDATE orders SET paid_cents = paid_cents + ?, status = CASE WHEN paid_cents + ? >= amount_cents THEN 'settled' ELSE 'accepted' END WHERE tenant=? AND order_id=?",
-            (amount_cents, amount_cents, tenant, order_id),
+            "UPDATE orders SET paid_cents=?, status=? WHERE tenant=? AND order_id=?",
+            (new_gross, new_status, tenant, order_id),
         )
         conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
     return get(tenant, order_id)

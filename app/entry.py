@@ -1,10 +1,13 @@
 import argparse
-from fastapi import FastAPI, Header, HTTPException, Response
+import json
+
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
-from app.config import tenant_header
-from app.store import orders
-from app.store.db import connect, migrate
+
 from app.rules import order_rules
+from app.store import orders, refunds
+from app.store.db import connect, migrate
+from app.store.refunds import ConflictError, OrderNotFound
 
 app = FastAPI(title="settlement-ledger")
 
@@ -58,6 +61,88 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
+
+def _require_tenant(x_tenant: str) -> str:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    return x_tenant
+
+async def _json_body(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    return body
+
+def _non_empty_str(value) -> bool:
+    return isinstance(value, str) and len(value) > 0
+
+def _positive_int(value) -> bool:
+    # 排除 bool：True/False 在 Python 中是 int 子类，不是合法金额。
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+@app.post("/refunds", status_code=201)
+async def register_refund(request: Request, response: Response) -> dict:
+    body = await _json_body(request)
+    tenant = body.get("tenant")
+    refund_id = body.get("refund_id")
+    order_id = body.get("order_id")
+    amount_cents = body.get("amount_cents")
+    reason = body.get("reason")
+    if not (_non_empty_str(tenant) and _non_empty_str(refund_id) and _non_empty_str(order_id)):
+        raise HTTPException(status_code=400, detail="tenant, refund_id and order_id are required")
+    if not _non_empty_str(reason):
+        raise HTTPException(status_code=400, detail="reason is required")
+    if not _positive_int(amount_cents):
+        raise HTTPException(status_code=400, detail="amount_cents must be a positive integer")
+
+    try:
+        refund, created = refunds.register(tenant, refund_id, order_id, amount_cents, reason)
+    except OrderNotFound:
+        # 订单不存在或不属于本租户统一按参数错误处理，不泄漏订单是否存在。
+        raise HTTPException(status_code=400, detail="order not found")
+    except ConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    if not created:
+        # 同一业务身份重复登记：不新建单据、不重复退款，返回既有单据及当前状态。
+        response.status_code = 200
+    return refund
+
+@app.get("/refunds/{refund_id}")
+def read_refund(refund_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    refund = refunds.get(tenant, refund_id)
+    if refund is None:
+        raise HTTPException(status_code=404, detail="refund not found")
+    return refund
+
+@app.post("/refunds/{refund_id}/review")
+async def review_refund(refund_id: str, request: Request, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    body = await _json_body(request)
+    decision = body.get("decision")
+    if decision not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="decision must be 'approve' or 'reject'")
+    try:
+        refund = refunds.review(tenant, refund_id, decision == "approve")
+    except ConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    if refund is None:
+        raise HTTPException(status_code=404, detail="refund not found")
+    return refund
+
+@app.post("/refunds/{refund_id}/reverse")
+def reverse_refund(refund_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    try:
+        refund = refunds.reverse(tenant, refund_id)
+    except ConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    if refund is None:
+        raise HTTPException(status_code=404, detail="refund not found")
+    return refund
 
 def main() -> None:
     parser = argparse.ArgumentParser()
