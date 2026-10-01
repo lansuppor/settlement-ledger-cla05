@@ -5,9 +5,11 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import orders, refunds
+from app.store import batches, orders, refunds
 from app.store.db import connect, migrate
 from app.store.refunds import ConflictError, OrderNotFound
+from app.usecase import batch_import
+from app.usecase.batch_import import CsvFormatError
 
 app = FastAPI(title="settlement-ledger")
 
@@ -61,6 +63,50 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
+
+@app.post("/orders/batch-accept", status_code=201)
+async def accept_orders_batch(request: Request, response: Response) -> dict:
+    # 两种导入形态：application/json 携带 csv 文本字段；其余 Content-Type 直接上传 CSV 字节，
+    # 租户与批次标识通过查询参数 tenant、batch_id 声明。
+    if request.headers.get("content-type", "").startswith("application/json"):
+        body = await _json_body(request)
+        tenant = body.get("tenant")
+        batch_id = body.get("batch_id")
+        csv_text = body.get("csv")
+        if not (_non_empty_str(tenant) and _non_empty_str(batch_id)):
+            raise HTTPException(status_code=400, detail="tenant and batch_id are required")
+        if not _non_empty_str(csv_text):
+            raise HTTPException(status_code=400, detail="csv is required")
+        raw = csv_text.encode("utf-8")
+    else:
+        tenant = request.query_params.get("tenant", "")
+        batch_id = request.query_params.get("batch_id", "")
+        if not (_non_empty_str(tenant) and _non_empty_str(batch_id)):
+            raise HTTPException(status_code=400, detail="tenant and batch_id query parameters are required")
+        raw = await request.body()
+        if not raw:
+            raise HTTPException(status_code=400, detail="csv body is required")
+
+    try:
+        result, processed = batch_import.accept_batch(tenant, batch_id, raw)
+    except CsvFormatError as error:
+        # CSV 格式非法：整批拒绝，不受理任何行。
+        raise HTTPException(status_code=400, detail=str(error))
+    except batches.InputMismatch as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    if not processed:
+        # 同一批次身份重试/重放：不重复受理，返回既有结果（HTTP 200）。
+        response.status_code = 200
+    return result
+
+@app.get("/batches/{batch_id}")
+def read_batch(batch_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    result = batches.get(tenant, batch_id)
+    if result is None:
+        # 跨租户查询一律按不存在处理，不泄漏批次是否存在。
+        raise HTTPException(status_code=404, detail="batch not found")
+    return result
 
 def _require_tenant(x_tenant: str) -> str:
     if not x_tenant:
