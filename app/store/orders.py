@@ -25,8 +25,9 @@ def get(tenant: str, order_id: str) -> dict | None:
     outstanding = row["amount_cents"] - row["paid_cents"]
     return {**dict(row), "outstanding_cents": outstanding}
 
-def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
+def add_payment(tenant: str, order_id: str, amount_cents: int, request_id: str | None = None) -> dict | None:
     conn = connect()
+    duplicate = False
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -36,14 +37,38 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
         if row is None:
             conn.execute("ROLLBACK")
             return None
-        if amount_cents <= 0 or row["paid_cents"] + amount_cents > row["amount_cents"]:
-            conn.execute("ROLLBACK")
-            raise ValueError("payment exceeds outstanding amount")
-        conn.execute(
-            "UPDATE orders SET paid_cents = paid_cents + ?, status = CASE WHEN paid_cents + ? >= amount_cents THEN 'settled' ELSE 'accepted' END WHERE tenant=? AND order_id=?",
-            (amount_cents, amount_cents, tenant, order_id),
-        )
-        conn.execute("COMMIT")
+        if request_id is not None:
+            seen = conn.execute(
+                "SELECT amount_cents FROM payment_requests WHERE tenant=? AND order_id=? AND request_id=?",
+                (tenant, order_id, request_id),
+            ).fetchone()
+            if seen is not None:
+                conn.execute("ROLLBACK")
+                if seen["amount_cents"] != amount_cents:
+                    raise ValueError("request_id already registered with a different amount")
+                duplicate = True
+        if not duplicate:
+            if amount_cents <= 0 or row["paid_cents"] + amount_cents > row["amount_cents"]:
+                conn.execute("ROLLBACK")
+                raise ValueError("payment exceeds outstanding amount")
+            if request_id is not None:
+                conn.execute(
+                    "INSERT INTO payment_requests(tenant, order_id, request_id, amount_cents) VALUES(?,?,?,?)",
+                    (tenant, order_id, request_id, amount_cents),
+                )
+            conn.execute(
+                "UPDATE orders SET paid_cents = paid_cents + ?, status = CASE WHEN paid_cents + ? >= amount_cents THEN 'settled' ELSE 'accepted' END WHERE tenant=? AND order_id=?",
+                (amount_cents, amount_cents, tenant, order_id),
+            )
+            conn.execute("COMMIT")
     finally:
         conn.close()
-    return get(tenant, order_id)
+    order = get(tenant, order_id)
+    if request_id is not None:
+        order["payment_result"] = {
+            "request_id": request_id,
+            "amount_cents": amount_cents,
+            "status": "applied",
+            "deduplicated": duplicate,
+        }
+    return order

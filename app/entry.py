@@ -16,6 +16,7 @@ class OrderIn(BaseModel):
 
 class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
+    request_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 @app.get("/health")
 def health() -> dict:
@@ -52,7 +53,7 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
     if not x_tenant:
         raise HTTPException(status_code=400, detail="tenant header is required")
     try:
-        order = orders.add_payment(x_tenant, order_id, body.amount_cents)
+        order = orders.add_payment(x_tenant, order_id, body.amount_cents, body.request_id)
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error))
     if order is None:

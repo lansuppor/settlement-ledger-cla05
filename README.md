@@ -17,11 +17,25 @@
 - `pytest -q`
 - 静态检查：`ruff check .`
 
+## 调用示例
+
+```bash
+# 受理订单
+curl -X POST localhost:8000/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant":"t1","order_id":"o1","amount_cents":500,"currency":"CNY"}'
+
+# 带去重标识登记收款（重复提交同一 request_id 不会二次累加）
+curl -X POST localhost:8000/orders/o1/payments \
+  -H 'Content-Type: application/json' -H 'X-Tenant: t1' \
+  -d '{"amount_cents":200,"request_id":"pay-req-001"}'
+```
+
 ## 已有公开接口
 
 - `POST /orders`：受理订单。请求字段 `tenant`、`order_id`、`amount_cents`、`currency`。成功返回 201 与订单对象；参数不合法返回 400；同一租户重复受理返回 409。
 - `GET /orders/{order_id}`：按标识读取订单。租户通过请求头 `X-Tenant` 传入；不存在返回 404；跨租户读取返回 404（不泄漏对象是否存在）。
-- `POST /orders/{order_id}/payments`：登记收款。请求字段 `amount_cents`；超过未收金额返回 409；成功返回 200 与订单的 `paid_cents`、`outstanding_cents`。
+- `POST /orders/{order_id}/payments`：登记收款。请求字段 `amount_cents`，可选 `request_id`（收款请求标识，用于去重）；超过未收金额返回 409；成功返回 200 与订单的 `paid_cents`、`outstanding_cents`。携带 `request_id` 时响应额外包含 `payment_result`（`request_id`、`amount_cents`、`status`、`deduplicated`）：同一（租户, 订单, `request_id`）重复提交返回 200 与首次相同的处理结果且金额不二次累加（`deduplicated: true`）；同标识不同金额返回 409（内容冲突，与超限的 409 以 `detail` 区分）；超限、订单不存在或跨租户时不写记录也不占用该标识，修正后可用同一 `request_id` 重新提交。不带 `request_id` 的登记行为与之前一致。
 - `GET /health`：返回服务与数据库状态。
 
 ## 数据与配置
