@@ -1,18 +1,24 @@
 import argparse
+from typing import Literal
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import orders, refunds
+from app.store import orders, refunds, workorders
 from app.store.db import connect, migrate
 from app.store.refunds import RefundConflict
+from app.store.workorders import WorkorderConflict
 
 app = FastAPI(title="settlement-ledger")
 
 @app.exception_handler(RefundConflict)
 def refund_conflict_handler(_request: Request, exc: RefundConflict) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+@app.exception_handler(WorkorderConflict)
+def workorder_conflict_handler(_request: Request, exc: WorkorderConflict) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 class OrderIn(BaseModel):
@@ -30,6 +36,21 @@ class RefundIn(BaseModel):
     request_id: str = Field(min_length=1)
 
 class RefundActionIn(BaseModel):
+    request_id: str = Field(min_length=1)
+
+class WorkorderIn(BaseModel):
+    workorder_id: str = Field(min_length=1)
+    claim_amount_cents: int = Field(gt=0)
+    initiator: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    request_id: str = Field(min_length=1)
+
+class WorkorderAdvanceIn(BaseModel):
+    request_id: str = Field(min_length=1)
+    to_status: Literal["processing", "pending_review", "resolved", "cancelled"]
+    award_cents: int | None = Field(default=None, gt=0)
+
+class WorkorderActionIn(BaseModel):
     request_id: str = Field(min_length=1)
 
 def _require_tenant(x_tenant: str) -> str:
@@ -120,6 +141,55 @@ def list_refunds(order_id: str, x_tenant: str = Header(default="")) -> dict:
     if items is None:
         raise HTTPException(status_code=404, detail="order not found")
     return {"order_id": order_id, "refunds": items}
+
+# ---- 工单 ----
+
+@app.post("/orders/{order_id}/refunds/{refund_id}/workorders", status_code=201)
+def create_workorder(order_id: str, refund_id: str, body: WorkorderIn, x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    status, payload = workorders.accept(
+        tenant, order_id, refund_id, body.workorder_id,
+        body.claim_amount_cents, body.initiator, body.reason, body.request_id,
+    )
+    return JSONResponse(status_code=status, content=payload)
+
+@app.post("/orders/{order_id}/refunds/{refund_id}/workorders/{workorder_id}/advance")
+def advance_workorder(
+    order_id: str, refund_id: str, workorder_id: str, body: WorkorderAdvanceIn,
+    x_tenant: str = Header(default=""),
+):
+    tenant = _require_tenant(x_tenant)
+    if body.to_status == "resolved" and body.award_cents is None:
+        raise HTTPException(status_code=400, detail="award_cents is required when resolving")
+    status, payload = workorders.advance(
+        tenant, order_id, refund_id, workorder_id, body.to_status, body.award_cents, body.request_id,
+    )
+    return JSONResponse(status_code=status, content=payload)
+
+@app.post("/orders/{order_id}/refunds/{refund_id}/workorders/{workorder_id}/cancel")
+def cancel_workorder(
+    order_id: str, refund_id: str, workorder_id: str, body: WorkorderActionIn,
+    x_tenant: str = Header(default=""),
+):
+    tenant = _require_tenant(x_tenant)
+    status, payload = workorders.cancel(tenant, order_id, refund_id, workorder_id, body.request_id)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.get("/orders/{order_id}/refunds/{refund_id}/workorders/{workorder_id}")
+def read_workorder(order_id: str, refund_id: str, workorder_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    workorder = workorders.get(tenant, order_id, refund_id, workorder_id)
+    if workorder is None:
+        raise HTTPException(status_code=404, detail="workorder not found")
+    return workorder
+
+@app.get("/orders/{order_id}/refunds/{refund_id}/workorders")
+def list_workorders(order_id: str, refund_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    items = workorders.list_for_refund(tenant, order_id, refund_id)
+    if items is None:
+        raise HTTPException(status_code=404, detail="refund not found")
+    return {"order_id": order_id, "refund_id": refund_id, "workorders": items}
 
 def main() -> None:
     parser = argparse.ArgumentParser()

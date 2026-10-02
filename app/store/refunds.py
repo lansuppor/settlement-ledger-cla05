@@ -1,6 +1,7 @@
 import json
 import sqlite3
 
+from app.store import workorders
 from app.store.db import connect
 
 # 退款单状态机：
@@ -164,6 +165,13 @@ def _advance(
                 conn.execute("COMMIT")
                 return 404, response
 
+            # 被进行中工单标记的退款单不得完成/撤销
+            if workorders.has_active(conn, tenant, order_id, refund_id):
+                response = {"detail": "refund is marked by an in-progress workorder"}
+                _save_idempotent(conn, tenant, request_id, op, order_id, refund_id, 409, response)
+                conn.execute("COMMIT")
+                return 409, response
+
             if refund["status"] == target_status:
                 response = {"detail": f"refund already {target_status}"}
                 _save_idempotent(conn, tenant, request_id, op, order_id, refund_id, 409, response)
@@ -235,6 +243,13 @@ def reverse(tenant: str, order_id: str, refund_id: str, request_id: str) -> tupl
                 _save_idempotent(conn, tenant, request_id, OP_REVERSE, order_id, refund_id, 404, response)
                 conn.execute("COMMIT")
                 return 404, response
+
+            # 被进行中工单标记的退款单不得冲正
+            if workorders.has_active(conn, tenant, order_id, refund_id):
+                response = {"detail": "refund is marked by an in-progress workorder"}
+                _save_idempotent(conn, tenant, request_id, OP_REVERSE, order_id, refund_id, 409, response)
+                conn.execute("COMMIT")
+                return 409, response
 
             if refund["status"] == REVERSED:
                 response = {"detail": "refund already reversed"}
