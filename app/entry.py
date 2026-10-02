@@ -5,7 +5,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import batches, orders, payment_rollbacks, refunds
+from app.store import batches, order_ledger, orders, payment_rollbacks, refunds
 from app.store.db import connect, migrate
 from app.store.refunds import ConflictError, OrderNotFound
 from app.usecase import batch_import
@@ -146,6 +146,44 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
+
+@app.get("/orders/{order_id}/ledger")
+def read_order_ledger(order_id: str, request: Request, x_tenant: str = Header(default="")) -> dict:
+    # 按订单查询账务流水：租户由 X-Tenant 声明，跨租户一律按订单不存在（404）处理，
+    # 不泄漏对象是否存在。
+    tenant = _require_tenant(x_tenant)
+    if orders.get(tenant, order_id) is None:
+        raise HTTPException(status_code=404, detail="order not found")
+
+    q = request.query_params
+    # 每页大小由调用方显式指定，必须为正整数。
+    page_size_raw = q.get("page_size")
+    if not _non_empty_str(page_size_raw):
+        raise HTTPException(status_code=400, detail="page_size is required and must be a positive integer")
+    page_size = _parse_positive_int(page_size_raw, "page_size")
+
+    cursor = None
+    cursor_raw = q.get("cursor")
+    if _non_empty_str(cursor_raw):
+        # 顺序位置取上一页最后一条流水的 seq；必须是正整数且指向本租户该订单的一条流水。
+        cursor = _parse_positive_int(cursor_raw, "cursor")
+
+    try:
+        entries, next_cursor = order_ledger.list_for_order(
+            tenant, order_id, cursor=cursor, limit=page_size
+        )
+    except order_ledger.InvalidCursor:
+        raise HTTPException(
+            status_code=400,
+            detail="cursor does not point to a ledger entry of this tenant and order",
+        )
+    return {
+        "order_id": order_id,
+        "entries": entries,
+        "page_size": page_size,
+        "next_cursor": next_cursor,
+        "has_next": next_cursor is not None,
+    }
 
 @app.post("/orders/batch-accept", status_code=201)
 async def accept_orders_batch(request: Request, response: Response) -> dict:

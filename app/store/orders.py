@@ -1,4 +1,6 @@
+from app.store import order_ledger
 from app.store.db import connect
+from app.store.order_ledger import PAYMENT, REF_ORDER
 from app.store.refunds import net_approved
 
 # 检索支持的订单状态口径，与订单对象 status 字段取值一致。
@@ -179,6 +181,17 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
         conn.execute(
             "UPDATE orders SET paid_cents=?, status=? WHERE tenant=? AND order_id=?",
             (new_gross, new_status, tenant, order_id),
+        )
+        # 收款不新建业务标识，按所属订单记入；金额调整与流水在同一事务内提交，同生同灭。
+        order_ledger.append(
+            conn,
+            tenant=tenant,
+            order_id=order_id,
+            action_type=PAYMENT,
+            ref_kind=REF_ORDER,
+            ref_id=order_id,
+            delta_cents=amount_cents,
+            balance_after_cents=new_gross - refunded,
         )
         conn.execute("COMMIT")
     except Exception:

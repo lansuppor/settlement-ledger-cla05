@@ -1,4 +1,6 @@
+from app.store import order_ledger
 from app.store.db import connect
+from app.store.order_ledger import PAYMENT_ROLLBACK, REF_ROLLBACK
 
 COMPLETED = "completed"
 
@@ -108,6 +110,17 @@ def register(tenant: str, rollback_id: str, order_id: str, amount_cents: int) ->
             "INSERT INTO payment_rollbacks(tenant, rollback_id, order_id, amount_cents, status) "
             "VALUES(?,?,?,?,'completed')",
             (tenant, rollback_id, order_id, amount_cents),
+        )
+        # 回退即反向退回已收金额：变化额为负，余额为回退后净已收；以回退标识回指本单据。
+        order_ledger.append(
+            conn,
+            tenant=tenant,
+            order_id=order_id,
+            action_type=PAYMENT_ROLLBACK,
+            ref_kind=REF_ROLLBACK,
+            ref_id=rollback_id,
+            delta_cents=-amount_cents,
+            balance_after_cents=new_net_paid,
         )
         conn.execute("COMMIT")
     except Exception:

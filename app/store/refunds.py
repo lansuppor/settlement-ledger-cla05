@@ -1,4 +1,12 @@
+from app.store import order_ledger
 from app.store.db import connect
+from app.store.order_ledger import (
+    REF_REFUND,
+    REFUND_APPROVED,
+    REFUND_REGISTERED,
+    REFUND_REJECTED,
+    REFUND_REVERSED,
+)
 
 PENDING = "pending"
 APPROVED = "approved"
@@ -83,6 +91,22 @@ def register(tenant: str, refund_id: str, order_id: str, amount_cents: int, reas
             "VALUES(?,?,?,?,?,'pending')",
             (tenant, refund_id, order_id, amount_cents, reason),
         )
+        # 登记只占用额度、不实际退款，对外已收金额不变：变化额记 0，余额保持当前净已收。
+        current_net = order["paid_cents"] - conn.execute(
+            "SELECT COALESCE(SUM(amount_cents),0) AS total FROM refunds "
+            "WHERE tenant=? AND order_id=? AND status='approved'",
+            (tenant, order_id),
+        ).fetchone()["total"]
+        order_ledger.append(
+            conn,
+            tenant=tenant,
+            order_id=order_id,
+            action_type=REFUND_REGISTERED,
+            ref_kind=REF_REFUND,
+            ref_id=refund_id,
+            delta_cents=0,
+            balance_after_cents=current_net,
+        )
         conn.execute("COMMIT")
     except Exception:
         _rollback(conn)
@@ -111,16 +135,17 @@ def review(tenant: str, refund_id: str, approve: bool) -> dict | None:
         if row["status"] == REVERSED:
             raise ConflictError("refund already reversed")
 
+        order = conn.execute(
+            "SELECT amount_cents, paid_cents FROM orders WHERE tenant=? AND order_id=?",
+            (tenant, row["order_id"]),
+        ).fetchone()
+        net_approved_total = conn.execute(
+            "SELECT COALESCE(SUM(amount_cents),0) AS total FROM refunds "
+            "WHERE tenant=? AND order_id=? AND status='approved'",
+            (tenant, row["order_id"]),
+        ).fetchone()["total"]
+        current_net = (order["paid_cents"] - net_approved_total) if order is not None else None
         if approve:
-            order = conn.execute(
-                "SELECT amount_cents, paid_cents FROM orders WHERE tenant=? AND order_id=?",
-                (tenant, row["order_id"]),
-            ).fetchone()
-            net_approved_total = conn.execute(
-                "SELECT COALESCE(SUM(amount_cents),0) AS total FROM refunds "
-                "WHERE tenant=? AND order_id=? AND status='approved'",
-                (tenant, row["order_id"]),
-            ).fetchone()["total"]
             if order is None or net_approved_total + row["amount_cents"] > order["paid_cents"]:
                 raise ConflictError("refund exceeds paid amount")
             # 退款生效后净已收严格小于订单金额，订单回到有待收余额的状态。
@@ -128,11 +153,28 @@ def review(tenant: str, refund_id: str, approve: bool) -> dict | None:
                 "UPDATE orders SET status='accepted' WHERE tenant=? AND order_id=?",
                 (tenant, row["order_id"]),
             )
+            # 同意即实际退款：对外已收按该笔金额扣减，变化额为负。
+            delta = -row["amount_cents"]
+            balance_after = current_net + delta
+        else:
+            # 拒绝只关闭单据、释放待审核占用，不动已收金额：变化额记 0。
+            delta = 0
+            balance_after = current_net if current_net is not None else 0
 
         new_status = APPROVED if approve else REJECTED
         conn.execute(
             "UPDATE refunds SET status=? WHERE tenant=? AND refund_id=?",
             (new_status, tenant, refund_id),
+        )
+        order_ledger.append(
+            conn,
+            tenant=tenant,
+            order_id=row["order_id"],
+            action_type=REFUND_APPROVED if approve else REFUND_REJECTED,
+            ref_kind=REF_REFUND,
+            ref_id=refund_id,
+            delta_cents=delta,
+            balance_after_cents=balance_after,
         )
         conn.execute("COMMIT")
     except Exception:
@@ -183,6 +225,17 @@ def reverse(tenant: str, refund_id: str) -> dict | None:
         conn.execute(
             "UPDATE orders SET status=? WHERE tenant=? AND order_id=?",
             (new_status, tenant, row["order_id"]),
+        )
+        # 冲正把该笔已生效退款全额加回对外已收，以新流水体现，不改写历史。
+        order_ledger.append(
+            conn,
+            tenant=tenant,
+            order_id=row["order_id"],
+            action_type=REFUND_REVERSED,
+            ref_kind=REF_REFUND,
+            ref_id=refund_id,
+            delta_cents=row["amount_cents"],
+            balance_after_cents=new_net_paid,
         )
         conn.execute("COMMIT")
     except Exception:
