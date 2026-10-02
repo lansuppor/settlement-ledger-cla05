@@ -1,3 +1,4 @@
+from app.store import account_entries
 from app.store.db import connect
 
 PENDING = "pending"
@@ -83,6 +84,22 @@ def register(tenant: str, refund_id: str, order_id: str, amount_cents: int, reas
             "VALUES(?,?,?,?,?,'pending')",
             (tenant, refund_id, order_id, amount_cents, reason),
         )
+        # 登记只占用额度、不实际退款，对外已收金额不变：变化额记 0，余额为当前净已收。
+        approved_total = conn.execute(
+            "SELECT COALESCE(SUM(amount_cents),0) AS total FROM refunds "
+            "WHERE tenant=? AND order_id=? AND status='approved'",
+            (tenant, order_id),
+        ).fetchone()["total"]
+        account_entries.append(
+            conn,
+            tenant=tenant,
+            order_id=order_id,
+            action_type=account_entries.REFUND_REGISTERED,
+            ref_type=account_entries.REF_REFUND,
+            ref_id=refund_id,
+            change_cents=0,
+            balance_cents=order["paid_cents"] - approved_total,
+        )
         conn.execute("COMMIT")
     except Exception:
         _rollback(conn)
@@ -134,6 +151,25 @@ def review(tenant: str, refund_id: str, approve: bool) -> dict | None:
             "UPDATE refunds SET status=? WHERE tenant=? AND refund_id=?",
             (new_status, tenant, refund_id),
         )
+        # 审核是一次生效的状态迁移：同意按金额扣减对外已收，拒绝不改变金额（变化额 0）。
+        # 余额按审核后的净已收口径重算；重复审核在上方提前返回，不会走到这里追加第二条。
+        balance = conn.execute(
+            "SELECT o.paid_cents - COALESCE(("
+            "SELECT SUM(amount_cents) FROM refunds "
+            "WHERE tenant=? AND order_id=? AND status='approved'),0) AS balance "
+            "FROM orders o WHERE o.tenant=? AND o.order_id=?",
+            (tenant, row["order_id"], tenant, row["order_id"]),
+        ).fetchone()["balance"]
+        account_entries.append(
+            conn,
+            tenant=tenant,
+            order_id=row["order_id"],
+            action_type=account_entries.REFUND_APPROVED if approve else account_entries.REFUND_REJECTED,
+            ref_type=account_entries.REF_REFUND,
+            ref_id=refund_id,
+            change_cents=-row["amount_cents"] if approve else 0,
+            balance_cents=balance,
+        )
         conn.execute("COMMIT")
     except Exception:
         _rollback(conn)
@@ -183,6 +219,18 @@ def reverse(tenant: str, refund_id: str) -> dict | None:
         conn.execute(
             "UPDATE orders SET status=? WHERE tenant=? AND order_id=?",
             (new_status, tenant, row["order_id"]),
+        )
+        # 冲正是反向动作：以一条新流水体现（变化额为正、恢复已收），不改写历史。
+        # 仅 approved 单据能走到这里；已冲正单据在上方提前冲突返回，不会追加第二条。
+        account_entries.append(
+            conn,
+            tenant=tenant,
+            order_id=row["order_id"],
+            action_type=account_entries.REFUND_REVERSED,
+            ref_type=account_entries.REF_REFUND,
+            ref_id=refund_id,
+            change_cents=row["amount_cents"],
+            balance_cents=new_net_paid,
         )
         conn.execute("COMMIT")
     except Exception:

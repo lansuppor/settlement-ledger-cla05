@@ -1,3 +1,4 @@
+from app.store import account_entries
 from app.store.db import connect
 
 COMPLETED = "completed"
@@ -108,6 +109,17 @@ def register(tenant: str, rollback_id: str, order_id: str, amount_cents: int) ->
             "INSERT INTO payment_rollbacks(tenant, rollback_id, order_id, amount_cents, status) "
             "VALUES(?,?,?,?,'completed')",
             (tenant, rollback_id, order_id, amount_cents),
+        )
+        # 回退单写入、金额调整与流水同事务提交；变化额为负（对外已收扣减），余额为回退后净已收。
+        account_entries.append(
+            conn,
+            tenant=tenant,
+            order_id=order_id,
+            action_type=account_entries.PAYMENT_ROLLED_BACK,
+            ref_type=account_entries.REF_ROLLBACK,
+            ref_id=rollback_id,
+            change_cents=-amount_cents,
+            balance_cents=new_net_paid,
         )
         conn.execute("COMMIT")
     except Exception:

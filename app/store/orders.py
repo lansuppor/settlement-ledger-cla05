@@ -1,3 +1,4 @@
+from app.store import account_entries
 from app.store.db import connect
 from app.store.refunds import net_approved
 
@@ -175,10 +176,23 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
             conn.execute("ROLLBACK")
             raise ValueError("payment exceeds outstanding amount")
         new_gross = row["paid_cents"] + amount_cents
-        new_status = "settled" if new_gross - refunded >= row["amount_cents"] else "accepted"
+        new_net = new_gross - refunded
+        new_status = "settled" if new_net >= row["amount_cents"] else "accepted"
         conn.execute(
             "UPDATE orders SET paid_cents=?, status=? WHERE tenant=? AND order_id=?",
             (new_gross, new_status, tenant, order_id),
+        )
+        # 收款无独立业务标识，按所属订单记入；金额调整与流水在同一事务内提交，
+        # 变化后余额取对外净已收口径，与订单对象 paid_cents 完全一致。
+        account_entries.append(
+            conn,
+            tenant=tenant,
+            order_id=order_id,
+            action_type=account_entries.PAYMENT_RECEIVED,
+            ref_type=account_entries.REF_PAYMENT,
+            ref_id=order_id,
+            change_cents=amount_cents,
+            balance_cents=new_net,
         )
         conn.execute("COMMIT")
     except Exception:

@@ -5,7 +5,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import batches, orders, payment_rollbacks, refunds
+from app.store import account_entries, batches, orders, payment_rollbacks, refunds
 from app.store.db import connect, migrate
 from app.store.refunds import ConflictError, OrderNotFound
 from app.usecase import batch_import
@@ -51,6 +51,40 @@ def read_order(order_id: str, x_tenant: str = Header(default="", alias=None)) ->
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
+
+@app.get("/orders/{order_id}/account-entries")
+def read_account_entries(
+    order_id: str, request: Request, x_tenant: str = Header(default="")
+) -> dict:
+    # 订单账务流水查询：租户由 X-Tenant 声明，跨租户一律按订单不存在处理，不泄漏对象是否存在。
+    tenant = _require_tenant(x_tenant)
+    q = request.query_params
+
+    # 每页大小由调用方显式指定，必须为正整数。
+    page_size_raw = q.get("page_size")
+    if not _non_empty_str(page_size_raw):
+        raise HTTPException(status_code=400, detail="page_size is required and must be a positive integer")
+    page_size = _parse_positive_int(page_size_raw, "page_size")
+
+    # cursor 为上一页最后一条流水的顺序位置（seq），返回其之后的流水；首页不传。
+    cursor = _parse_positive_int(q.get("cursor"), "cursor") if _non_empty_str(q.get("cursor")) else None
+
+    try:
+        result = account_entries.list_for_order(tenant, order_id, cursor=cursor, limit=page_size)
+    except account_entries.InvalidCursor:
+        raise HTTPException(
+            status_code=400,
+            detail="cursor does not point to an account entry of this order",
+        )
+    if result is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    entries, next_cursor = result
+    return {
+        "entries": entries,
+        "page_size": page_size,
+        "next_cursor": next_cursor,
+        "has_next": next_cursor is not None,
+    }
 
 @app.get("/orders")
 def search_orders(request: Request, x_tenant: str = Header(default="")) -> dict:
