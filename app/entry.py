@@ -5,8 +5,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import orders, refunds, settlements, tickets
+from app.store import orders, reconciliations, refunds, settlements, tickets
 from app.store.db import connect, migrate
+from app.store.reconciliations import ReconciliationConflict
 from app.store.refunds import RefundConflict
 from app.store.settlements import SettlementConflict
 from app.store.tickets import TicketConflict
@@ -23,6 +24,10 @@ def settlement_conflict_handler(_request: Request, exc: SettlementConflict) -> J
 
 @app.exception_handler(TicketConflict)
 def ticket_conflict_handler(_request: Request, exc: TicketConflict) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+@app.exception_handler(ReconciliationConflict)
+def reconciliation_conflict_handler(_request: Request, exc: ReconciliationConflict) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 class OrderIn(BaseModel):
@@ -54,6 +59,15 @@ class TicketActionIn(BaseModel):
 
 class TicketResolveIn(BaseModel):
     award_cents: int = Field(gt=0)
+    request_id: str = Field(min_length=1)
+
+class ReconciliationIn(BaseModel):
+    reconciliation_id: str = Field(min_length=1)
+    amount_cents: int = Field(gt=0)
+    reason: str = Field(min_length=1)
+    request_id: str = Field(min_length=1)
+
+class ReconciliationActionIn(BaseModel):
     request_id: str = Field(min_length=1)
 
 class SettlementIn(BaseModel):
@@ -216,6 +230,75 @@ def list_tickets(order_id: str, refund_id: str, x_tenant: str = Header(default="
     if items is None:
         raise HTTPException(status_code=404, detail="refund not found")
     return {"order_id": order_id, "refund_id": refund_id, "tickets": items}
+
+# ---- 对账单（退款单对账核销） ----
+
+@app.post("/orders/{order_id}/refunds/{refund_id}/reconciliations", status_code=201)
+def create_reconciliation(order_id: str, refund_id: str, body: ReconciliationIn,
+                          x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    status, payload = reconciliations.accept(
+        tenant, order_id, refund_id, body.reconciliation_id,
+        body.amount_cents, body.reason, body.request_id)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.post("/orders/{order_id}/refunds/{refund_id}/reconciliations/{reconciliation_id}/reconcile")
+def reconcile_reconciliation(order_id: str, refund_id: str, reconciliation_id: str,
+                             body: ReconciliationActionIn, x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    status, payload = reconciliations.reconcile(
+        tenant, order_id, refund_id, reconciliation_id, body.request_id)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.post("/orders/{order_id}/refunds/{refund_id}/reconciliations/{reconciliation_id}/cancel")
+def cancel_reconciliation(order_id: str, refund_id: str, reconciliation_id: str,
+                          body: ReconciliationActionIn, x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    status, payload = reconciliations.cancel(
+        tenant, order_id, refund_id, reconciliation_id, body.request_id)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.post("/orders/{order_id}/refunds/{refund_id}/reconciliations/{reconciliation_id}/reverse")
+def reverse_reconciliation(order_id: str, refund_id: str, reconciliation_id: str,
+                           body: ReconciliationActionIn, x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    status, payload = reconciliations.reverse(
+        tenant, order_id, refund_id, reconciliation_id, body.request_id)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.get("/orders/{order_id}/refunds/{refund_id}/reconciliations/{reconciliation_id}")
+def read_reconciliation(order_id: str, refund_id: str, reconciliation_id: str,
+                        x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    reconciliation = reconciliations.get(tenant, order_id, refund_id, reconciliation_id)
+    if reconciliation is None:
+        raise HTTPException(status_code=404, detail="reconciliation not found")
+    return reconciliation
+
+@app.get("/orders/{order_id}/refunds/{refund_id}/reconciliations")
+def list_reconciliations(order_id: str, refund_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    items = reconciliations.list_for_refund(tenant, order_id, refund_id)
+    if items is None:
+        raise HTTPException(status_code=404, detail="refund not found")
+    return {"order_id": order_id, "refund_id": refund_id, "reconciliations": items}
+
+@app.get("/reconciliations")
+def search_reconciliations(status: str = "", min_amount_cents: int | None = None,
+                           max_amount_cents: int | None = None,
+                           x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    if status and status not in reconciliations.STATUSES:
+        raise HTTPException(status_code=400, detail=f"unknown status: {status}")
+    if min_amount_cents is not None and max_amount_cents is not None and min_amount_cents > max_amount_cents:
+        raise HTTPException(status_code=400, detail="min_amount_cents exceeds max_amount_cents")
+    items = reconciliations.search(
+        tenant,
+        status=status or None,
+        min_amount_cents=min_amount_cents,
+        max_amount_cents=max_amount_cents,
+    )
+    return {"reconciliations": items}
 
 # ---- 结算单 ----
 
