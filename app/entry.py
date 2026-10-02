@@ -5,15 +5,20 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import orders, refunds, tickets
+from app.store import orders, refunds, settlements, tickets
 from app.store.db import connect, migrate
 from app.store.refunds import RefundConflict
+from app.store.settlements import SettlementConflict
 from app.store.tickets import TicketConflict
 
 app = FastAPI(title="settlement-ledger")
 
 @app.exception_handler(RefundConflict)
 def refund_conflict_handler(_request: Request, exc: RefundConflict) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+@app.exception_handler(SettlementConflict)
+def settlement_conflict_handler(_request: Request, exc: SettlementConflict) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 @app.exception_handler(TicketConflict)
@@ -49,6 +54,15 @@ class TicketActionIn(BaseModel):
 
 class TicketResolveIn(BaseModel):
     award_cents: int = Field(gt=0)
+    request_id: str = Field(min_length=1)
+
+class SettlementIn(BaseModel):
+    settlement_id: str = Field(min_length=1)
+    amount_cents: int = Field(gt=0)
+    reason: str = Field(min_length=1)
+    request_id: str = Field(min_length=1)
+
+class SettlementActionIn(BaseModel):
     request_id: str = Field(min_length=1)
 
 def _require_tenant(x_tenant: str) -> str:
@@ -202,6 +216,69 @@ def list_tickets(order_id: str, refund_id: str, x_tenant: str = Header(default="
     if items is None:
         raise HTTPException(status_code=404, detail="refund not found")
     return {"order_id": order_id, "refund_id": refund_id, "tickets": items}
+
+# ---- 结算单 ----
+
+@app.post("/orders/{order_id}/settlements", status_code=201)
+def create_settlement(order_id: str, body: SettlementIn, x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    status, payload = settlements.accept(
+        tenant, order_id, body.settlement_id, body.amount_cents, body.reason, body.request_id)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.post("/orders/{order_id}/settlements/{settlement_id}/settle")
+def settle_settlement(order_id: str, settlement_id: str, body: SettlementActionIn,
+                      x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    status, payload = settlements.settle(tenant, order_id, settlement_id, body.request_id)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.post("/orders/{order_id}/settlements/{settlement_id}/cancel")
+def cancel_settlement(order_id: str, settlement_id: str, body: SettlementActionIn,
+                      x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    status, payload = settlements.cancel(tenant, order_id, settlement_id, body.request_id)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.post("/orders/{order_id}/settlements/{settlement_id}/reverse")
+def reverse_settlement(order_id: str, settlement_id: str, body: SettlementActionIn,
+                       x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    status, payload = settlements.reverse(tenant, order_id, settlement_id, body.request_id)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.get("/orders/{order_id}/settlements/{settlement_id}")
+def read_settlement(order_id: str, settlement_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    settlement = settlements.get(tenant, order_id, settlement_id)
+    if settlement is None:
+        raise HTTPException(status_code=404, detail="settlement not found")
+    return settlement
+
+@app.get("/orders/{order_id}/settlements")
+def list_settlements(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    items = settlements.list_for_order(tenant, order_id)
+    if items is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return {"order_id": order_id, "settlements": items}
+
+@app.get("/settlements")
+def search_settlements(status: str = "", min_amount_cents: int | None = None,
+                       max_amount_cents: int | None = None,
+                       x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    if status and status not in settlements.STATUSES:
+        raise HTTPException(status_code=400, detail=f"unknown status: {status}")
+    if min_amount_cents is not None and max_amount_cents is not None and min_amount_cents > max_amount_cents:
+        raise HTTPException(status_code=400, detail="min_amount_cents exceeds max_amount_cents")
+    items = settlements.search(
+        tenant,
+        status=status or None,
+        min_amount_cents=min_amount_cents,
+        max_amount_cents=max_amount_cents,
+    )
+    return {"settlements": items}
 
 def main() -> None:
     parser = argparse.ArgumentParser()

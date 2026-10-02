@@ -1,3 +1,4 @@
+from app.store import settlements
 from app.store.db import connect
 
 
@@ -36,7 +37,9 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
         if row is None:
             conn.execute("ROLLBACK")
             return None
-        if amount_cents <= 0 or row["paid_cents"] + amount_cents > row["amount_cents"]:
+        # 未收金额须扣除进行中结算单的占用：收款不得侵占已受理结算单锁定的余额
+        occupied = settlements.pending_sum_conn(conn, tenant, order_id)
+        if amount_cents <= 0 or row["paid_cents"] + amount_cents + occupied > row["amount_cents"]:
             conn.execute("ROLLBACK")
             raise ValueError("payment exceeds outstanding amount")
         conn.execute(
