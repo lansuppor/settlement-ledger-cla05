@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额、收款回退（登记后发现收错或重复收款时反向退回），以及退款单的登记、读取、审核（同意/拒绝）与冲正（撤销）；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额、收款回退（登记后发现收错或重复收款时反向退回）、退款单的登记、读取、审核（同意/拒绝）与冲正（撤销）、订单账务流水查询，以及订单对账核销（把账务流水与订单当前金额的核对结论固化为不可变更的对账单）；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -31,6 +31,8 @@
 - `POST /orders/{order_id}/payments`：登记收款。请求字段 `amount_cents`；超过未收金额返回 409；成功返回 200 与订单的 `paid_cents`、`outstanding_cents`。
 - `POST /payment-rollbacks`：收款回退。请求字段 `tenant`、`rollback_id`、`order_id`、`amount_cents`；`amount_cents` 为大于 0 的最小货币单位整数，回退以（租户, `rollback_id`）为业务身份。成功返回 201 与状态为 `completed` 的回退单；同一（租户, `rollback_id`）重复请求不新建记录、不重复退回金额，返回 200 与既有回退结果（业务身份与请求携带的金额/订单指纹无关）。回退后订单净已收按净额重算，未收 = 订单金额 − 已收。订单不存在或非本租户、金额非法、回退金额超过订单当前已收金额返回 400；回退会使退款占用额度（待审核 + 已生效未冲正）超过回退后已收金额、即超出剩余可回退额度，返回 409 且不改变任何数据。
 - `GET /payment-rollbacks/{rollback_id}`：按回退标识读取收款回退单。租户通过请求头 `X-Tenant` 传入；不存在或跨租户一律返回 404（不泄漏对象是否存在）。
+- `POST /reconciliations`：发起订单对账核销，生成不可变更的对账单（见“订单对账核销”）。请求字段 `tenant`、`reconcile_id`、`scope`（可选）。首次成功返回 201 与对账单；同一（租户, `reconcile_id`）重复提交不重新核对、不改变既有结论，返回 200 与既有对账单（与本次携带的范围指纹无关）。
+- `GET /reconciliations/{reconcile_id}`：按标识读取对账单。租户通过请求头 `X-Tenant` 传入；不存在或跨租户一律返回 404（不泄漏对象是否存在）。
 - `POST /orders/batch-accept`：批量受理订单。批次身份为（租户, `batch_id`）。支持两种提交形态：
   - `application/json`：请求字段 `tenant`、`batch_id`、`csv`（CSV 文本）。
   - 直接上传 CSV 文件（如 `Content-Type: text/csv`）：请求体即 CSV 字节，`tenant` 与 `batch_id` 通过查询参数传入（`?tenant=t1&batch_id=...`）。
@@ -82,6 +84,21 @@
 - `cursor` 必须指向本租户该订单的一条真实流水，否则返回 400（属于其他租户或其他订单的顺序位置同样按参数错误处理，不泄漏对象是否存在）。
 - 返回 `entries`（按 `seq` 升序）、`page_size`、`next_cursor`、`has_next`；末页 `has_next` 为假且 `next_cursor` 为空。无新动作时每次读取顺序与内容一致；查询在单个只读事务、同一份已提交快照内完成，并发动作落库后后续查询看到其完整流水，绝不出现半条记录。
 - 订单受理不是账务动作，不产生流水；刚受理、尚无账务动作的订单返回空流水页。
+
+### 订单对账核销
+
+对账把账务流水与订单当前金额的核对结论固化为一张可查询的对账单，回答某个时点账面是否闭合、差异出在哪一笔。
+
+- 业务身份为（租户, `reconcile_id`）：同一身份重复提交不重新核对、不改变既有结论，只返回既有对账单（HTTP 200），与本次请求携带的范围指纹无关；首次核对返回 201。每次对账恰好生成一张对账单。
+- 请求字段：`tenant`、`reconcile_id`、`scope`（可省略，表示核对本租户全部订单）。`scope` 支持：
+  - `order_id`：指定单张订单；
+  - `amount_min`/`amount_max`：订单金额区间，`outstanding_min`/`outstanding_max`：未收金额区间（口径与 `GET /orders` 一致，非负整数、含边界、可只给一侧）；
+  - 多条件同时给出取交集。区间端点非法（负数/非整数/下限大于上限）或范围内没有任何订单（含指定订单不存在或非本租户）返回 400，不留下半张对账单。
+- 核对在一个数据库只读事务、同一份已提交快照内纯读取完成，不改变任何订单、收款、回退、退款与流水；随后把结论作为一张不可变对账单整体落库，服务重启后重读结论一致。
+- 范围内每张订单给出：`order_id`、订单金额 `amount_cents`、对外已收 `paid_cents`、未收 `outstanding_cents`、逐条流水（含逐条累计的应有余额 `expected_balance_cents` 与衔接结论 `chained`）、末条流水余额 `last_balance_cents`、`chain_intact`（逐条衔接）、`final_balance_matches`（末条余额等于当前对外已收）、`amount_closed`（订单金额 = 已收 + 未收）与差异原因 `difference_reasons`。
+- 对账单状态：全部订单逐条衔接、末条余额等于当前对外已收且金额闭合为 `reconciled`（已核销）；任一订单不满足为 `difference_found`（有差异）。差异原因取值：`balance_chain_broken`（余额衔接断链）、`final_balance_mismatch`（末条余额与当前已收不一致）、`amount_not_closed`（金额不闭合）。
+- 对账单返回对账单标识、状态、核对订单总数 `total_orders`、差异订单数 `difference_count`、差异清单 `differences`（逐张订单给出 `order_id` 与 `reasons`）与核对时点 `checked_at`。
+- `GET /reconciliations/{reconcile_id}` 按标识读取，租户由 `X-Tenant` 头传入；不存在或跨租户一律 404，不泄漏对象是否存在。不同对账标识并发核对同一范围，各自得到独立且一致的结论。
 
 ### 批量受理
 
@@ -155,6 +172,21 @@ curl -s 'http://127.0.0.1:8000/orders/demo-1/account-entries?page_size=20' -H 'X
 
 # 用上一页返回的 next_cursor（末条流水的 seq）继续翻页
 curl -s 'http://127.0.0.1:8000/orders/demo-1/account-entries?page_size=20&cursor=8' -H 'X-Tenant: t1'
+```
+
+```bash
+# 发起对账核销（scope 可指定单张订单或订单金额/未收金额区间，多条件取交集；省略 scope 核对本租户全部订单）
+curl -s -X POST http://127.0.0.1:8000/reconciliations \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant":"t1","reconcile_id":"rec-20261001","scope":{"outstanding_min":0,"outstanding_max":100000}}'
+
+# 同一（租户, reconcile_id）重复提交：返回 200 与既有对账单，不重新核对（范围指纹不同也一样）
+curl -s -X POST http://127.0.0.1:8000/reconciliations \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant":"t1","reconcile_id":"rec-20261001","scope":{}}'
+
+# 按标识读取对账单（需 X-Tenant 头；不存在或跨租户一律 404）
+curl -s http://127.0.0.1:8000/reconciliations/rec-20261001 -H 'X-Tenant: t1'
 ```
 
 ```bash

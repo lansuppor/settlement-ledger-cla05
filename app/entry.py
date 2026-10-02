@@ -5,7 +5,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import account_entries, batches, orders, payment_rollbacks, refunds
+from app.store import account_entries, batches, orders, payment_rollbacks, reconciliations, refunds
 from app.store.db import connect, migrate
 from app.store.refunds import ConflictError, OrderNotFound
 from app.usecase import batch_import
@@ -340,6 +340,72 @@ def read_payment_rollback(rollback_id: str, x_tenant: str = Header(default="")) 
     if rollback is None:
         raise HTTPException(status_code=404, detail="payment rollback not found")
     return rollback
+
+@app.post("/reconciliations", status_code=201)
+async def create_reconciliation(request: Request, response: Response) -> dict:
+    body = await _json_body(request)
+    tenant = body.get("tenant")
+    reconcile_id = body.get("reconcile_id")
+    if not (_non_empty_str(tenant) and _non_empty_str(reconcile_id)):
+        raise HTTPException(status_code=400, detail="tenant and reconcile_id are required")
+
+    # 对账范围（可全部缺省表示核对本租户全部订单）：单张订单与金额/未收区间取交集，
+    # 端点口径与 GET /orders 的区间参数完全一致（非负整数、含边界、可只给一侧）。
+    scope = body.get("scope")
+    if scope is None:
+        scope = {}
+    if not isinstance(scope, dict):
+        raise HTTPException(status_code=400, detail="scope must be an object")
+    order_id = scope.get("order_id")
+    if order_id is not None and not _non_empty_str(order_id):
+        raise HTTPException(status_code=400, detail="scope.order_id must be a non-empty string")
+
+    amount_min = _parse_body_bound(scope.get("amount_min"), "amount_min")
+    amount_max = _parse_body_bound(scope.get("amount_max"), "amount_max")
+    outstanding_min = _parse_body_bound(scope.get("outstanding_min"), "outstanding_min")
+    outstanding_max = _parse_body_bound(scope.get("outstanding_max"), "outstanding_max")
+    if amount_min is not None and amount_max is not None and amount_min > amount_max:
+        raise HTTPException(status_code=400, detail="amount_min must not be greater than amount_max")
+    if outstanding_min is not None and outstanding_max is not None and outstanding_min > outstanding_max:
+        raise HTTPException(
+            status_code=400,
+            detail="outstanding_min must not be greater than outstanding_max",
+        )
+
+    try:
+        statement, created = reconciliations.reconcile(
+            tenant,
+            reconcile_id,
+            order_id=order_id,
+            amount_min=amount_min,
+            amount_max=amount_max,
+            outstanding_min=outstanding_min,
+            outstanding_max=outstanding_max,
+        )
+    except reconciliations.EmptyScope:
+        # 范围端点合法但范围内没有任何订单：参数错误，不留下半张对账单。
+        raise HTTPException(status_code=400, detail="no order matches the reconcile scope")
+    if not created:
+        # 同一（租户, 对账标识）重复提交：不重新核对、不改变既有结论，返回既有对账单。
+        response.status_code = 200
+    return statement
+
+@app.get("/reconciliations/{reconcile_id}")
+def read_reconciliation(reconcile_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    statement = reconciliations.get(tenant, reconcile_id)
+    if statement is None:
+        # 不存在或跨租户一律按不存在处理，不泄漏对账单是否存在。
+        raise HTTPException(status_code=404, detail="reconciliation not found")
+    return statement
+
+def _parse_body_bound(value, name: str) -> int | None:
+    # JSON 请求体的区间端点：缺省为 None；给出时必须是非负整数（bool 不是合法金额端点）。
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise HTTPException(status_code=400, detail=f"scope.{name} must be a non-negative integer")
+    return value
 
 def main() -> None:
     parser = argparse.ArgumentParser()
