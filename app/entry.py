@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
@@ -41,6 +42,62 @@ def create_order(body: OrderIn) -> dict:
             raise HTTPException(status_code=409, detail="order already accepted")
         raise
     return orders.get(body.tenant, body.order_id)
+
+ORDER_STATUSES = ("accepted", "settled")
+
+@app.get("/orders")
+def search_orders(
+    status: str | None = None,
+    amount_min: str | None = None,
+    amount_max: str | None = None,
+    outstanding_min: str | None = None,
+    outstanding_max: str | None = None,
+    page_size: str | None = None,
+    cursor: str | None = None,
+    x_tenant: str = Header(default=""),
+) -> dict:
+    # 订单条件检索：状态/订单金额/未收金额区间取交集，按订单标识升序游标分页。
+    tenant = _require_tenant(x_tenant)
+    if status is not None and status not in ORDER_STATUSES:
+        raise HTTPException(status_code=400, detail="status must be 'accepted' or 'settled'")
+    amount_lo = _amount_bound(amount_min, "amount_min")
+    amount_hi = _amount_bound(amount_max, "amount_max")
+    if amount_lo is not None and amount_hi is not None and amount_lo > amount_hi:
+        raise HTTPException(status_code=400, detail="amount_min must not exceed amount_max")
+    outstanding_lo = _amount_bound(outstanding_min, "outstanding_min")
+    outstanding_hi = _amount_bound(outstanding_max, "outstanding_max")
+    if outstanding_lo is not None and outstanding_hi is not None and outstanding_lo > outstanding_hi:
+        raise HTTPException(status_code=400, detail="outstanding_min must not exceed outstanding_max")
+    if page_size is None:
+        raise HTTPException(status_code=400, detail="page_size is required")
+    size = _positive_int_param(page_size, "page_size")
+    if cursor is not None and cursor != "" and orders.get(tenant, cursor) is None:
+        # 游标必须指向本租户已存在的订单，否则按参数错误处理（不泄漏其他租户）。
+        raise HTTPException(status_code=400, detail="cursor does not reference an existing order")
+    items, total, has_next = orders.search(
+        tenant,
+        status=status,
+        amount_min=amount_lo,
+        amount_max=amount_hi,
+        outstanding_min=outstanding_lo,
+        outstanding_max=outstanding_hi,
+        limit=size,
+        cursor=cursor or None,
+    )
+    return {"items": items, "total": total, "has_next": has_next}
+
+def _amount_bound(raw: str | None, name: str) -> int | None:
+    # 区间端点：非负的最小货币单位整数，含边界；非法取值按参数错误处理。
+    if raw is None:
+        return None
+    if re.fullmatch(r"[0-9]+", raw.strip()) is None:
+        raise HTTPException(status_code=400, detail=f"{name} must be a non-negative integer")
+    return int(raw)
+
+def _positive_int_param(raw: str, name: str) -> int:
+    if re.fullmatch(r"[0-9]+", raw.strip()) is None or int(raw) <= 0:
+        raise HTTPException(status_code=400, detail=f"{name} must be a positive integer")
+    return int(raw)
 
 @app.get("/orders/{order_id}")
 def read_order(order_id: str, x_tenant: str = Header(default="", alias=None)) -> dict:
