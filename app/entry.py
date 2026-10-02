@@ -52,6 +52,89 @@ def read_order(order_id: str, x_tenant: str = Header(default="", alias=None)) ->
         raise HTTPException(status_code=404, detail="order not found")
     return order
 
+@app.get("/orders")
+def search_orders(request: Request, x_tenant: str = Header(default="")) -> dict:
+    # 条件检索入口：租户仍由 X-Tenant 声明，所有过滤都强制限定在本租户内，
+    # 跨租户检索一律得到空结果，无法据此判断其他租户是否存在匹配订单。
+    tenant = _require_tenant(x_tenant)
+    q = request.query_params
+
+    status = _optional_str(q.get("status"))
+    if status is not None and status not in orders.SEARCHABLE_STATUSES:
+        raise HTTPException(status_code=400, detail="status must be 'accepted' or 'settled'")
+
+    amount_min = _parse_bound(q.get("amount_min"), "amount_min")
+    amount_max = _parse_bound(q.get("amount_max"), "amount_max")
+    outstanding_min = _parse_bound(q.get("outstanding_min"), "outstanding_min")
+    outstanding_max = _parse_bound(q.get("outstanding_max"), "outstanding_max")
+    if amount_min is not None and amount_max is not None and amount_min > amount_max:
+        raise HTTPException(status_code=400, detail="amount_min must not be greater than amount_max")
+    if outstanding_min is not None and outstanding_max is not None and outstanding_min > outstanding_max:
+        raise HTTPException(
+            status_code=400,
+            detail="outstanding_min must not be greater than outstanding_max",
+        )
+
+    # 每页大小由调用方显式指定，必须为正整数。
+    page_size_raw = q.get("page_size")
+    if not _non_empty_str(page_size_raw):
+        raise HTTPException(status_code=400, detail="page_size is required and must be a positive integer")
+    page_size = _parse_positive_int(page_size_raw, "page_size")
+
+    cursor = _optional_str(q.get("cursor"))
+
+    try:
+        page, total, next_cursor = orders.search(
+            tenant,
+            status=status,
+            amount_min=amount_min,
+            amount_max=amount_max,
+            outstanding_min=outstanding_min,
+            outstanding_max=outstanding_max,
+            cursor=cursor,
+            limit=page_size,
+        )
+    except orders.InvalidCursor:
+        # 游标指向本租户不存在的订单：参数错误，与内部错误区分。
+        raise HTTPException(status_code=400, detail="cursor does not point to an order of this tenant")
+    return {
+        "orders": page,
+        "total": total,
+        "page_size": page_size,
+        "next_cursor": next_cursor,
+        "has_next": next_cursor is not None,
+    }
+
+def _optional_str(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+def _parse_bound(value: str | None, name: str) -> int | None:
+    # 区间端点可缺省；给出时必须是非负整数（含边界，0 合法），浮点/负数/非数字一律参数错误。
+    if not _non_empty_str(value):
+        return None
+    return _parse_non_negative_int(value, name)
+
+def _parse_non_negative_int(value: str, name: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{name} must be a non-negative integer")
+    if isinstance(parsed, bool) or parsed < 0:
+        raise HTTPException(status_code=400, detail=f"{name} must be a non-negative integer")
+    return parsed
+
+def _parse_positive_int(value: str, name: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{name} must be a positive integer")
+    if isinstance(parsed, bool) or parsed <= 0:
+        raise HTTPException(status_code=400, detail=f"{name} must be a positive integer")
+    return parsed
+
 @app.post("/orders/{order_id}/payments")
 def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="")) -> dict:
     if not x_tenant:

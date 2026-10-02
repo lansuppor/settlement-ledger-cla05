@@ -21,6 +21,12 @@
 
 - `POST /orders`：受理订单。请求字段 `tenant`、`order_id`、`amount_cents`、`currency`。成功返回 201 与订单对象；参数不合法返回 400；同一租户重复受理返回 409。
 - `GET /orders/{order_id}`：按标识读取订单。租户通过请求头 `X-Tenant` 传入；不存在返回 404；跨租户读取返回 404（不泄漏对象是否存在）。
+- `GET /orders`：按条件检索订单（订单标识之外的检索入口）。租户通过请求头 `X-Tenant` 传入，结果只含本租户订单；跨租户检索一律得到空结果，不泄漏其他租户是否有匹配订单。查询参数：
+  - `page_size`（必传）：每页条数，正整数；`cursor`（可选）：上一页最后一条订单标识，返回其**之后**的订单。
+  - `status`（可选）：`accepted`（受理中）或 `settled`（已结清），与订单对象 `status` 字段口径一致。
+  - 金额区间（可选，含边界，可只给上限或下限，非负整数）：`amount_min`/`amount_max` 按订单金额过滤；`outstanding_min`/`outstanding_max` 按未收金额过滤（金额口径与订单读取一致，未收 = 订单金额 − 净已收）。
+  - 多条件同时给出取交集；区间端点非法（负数/非整数/下限大于上限）、状态取值不支持、游标不指向本租户订单均返回 400，与 500 区分。
+  - 返回 `orders`（按订单标识升序）、`total`（该条件下订单总数，与页大小/页码无关）、`page_size`、`next_cursor`、`has_next`。同一组条件下顺序稳定；无写入时游标逐页取完与一次取全得到完全相同的订单集合，不重不漏。翻页期间新提交的收款/回退/退款审核/冲正只影响后续页所见状态，单次读取不会出现半张单据，连续翻页中每张订单只出现一次。
 - `POST /orders/{order_id}/payments`：登记收款。请求字段 `amount_cents`；超过未收金额返回 409；成功返回 200 与订单的 `paid_cents`、`outstanding_cents`。
 - `POST /payment-rollbacks`：收款回退。请求字段 `tenant`、`rollback_id`、`order_id`、`amount_cents`；`amount_cents` 为大于 0 的最小货币单位整数，回退以（租户, `rollback_id`）为业务身份。成功返回 201 与状态为 `completed` 的回退单；同一（租户, `rollback_id`）重复请求不新建记录、不重复退回金额，返回 200 与既有回退结果（业务身份与请求携带的金额/订单指纹无关）。回退后订单净已收按净额重算，未收 = 订单金额 − 已收。订单不存在或非本租户、金额非法、回退金额超过订单当前已收金额返回 400；回退会使退款占用额度（待审核 + 已生效未冲正）超过回退后已收金额、即超出剩余可回退额度，返回 409 且不改变任何数据。
 - `GET /payment-rollbacks/{rollback_id}`：按回退标识读取收款回退单。租户通过请求头 `X-Tenant` 传入；不存在或跨租户一律返回 404（不泄漏对象是否存在）。
@@ -81,6 +87,14 @@
 - 退款支持逐笔登记、审核与冲正，未实现部分退款的分期审批流与对账报表。
 
 ## 调用示例
+
+```bash
+# 条件检索（X-Tenant 限定租户；可组合状态、订单金额/未收金额区间，取交集）
+curl -s 'http://127.0.0.1:8000/orders?page_size=20&status=accepted&outstanding_min=100' -H 'X-Tenant: t1'
+
+# 用上一页返回的 next_cursor 继续翻页（游标之后的订单，每页最多 page_size 条）
+curl -s 'http://127.0.0.1:8000/orders?page_size=20&status=accepted&cursor=o-101' -H 'X-Tenant: t1'
+```
 
 ```bash
 # 登记退款单（退款单以租户 + refund_id 唯一）
