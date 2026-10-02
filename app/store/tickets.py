@@ -1,6 +1,7 @@
 import json
 import sqlite3
 
+from app.store import reconciliations
 from app.store.db import connect
 
 # 工单状态机：
@@ -243,8 +244,11 @@ def _advance(
             if op == OP_RESOLVE:
                 refund = _get_refund_conn(conn, tenant, order_id, refund_id)
                 award = award_cents or 0
-                # 裁决金额为正整数，且不超过处理请求金额与退款单当前金额
-                if award <= 0 or award > ticket["request_amount_cents"] or award > refund["amount_cents"]:
+                # 裁决金额为正整数，且不超过处理请求金额与退款单当前金额；
+                # 扣减后退款单金额不得小于对账单已核销合计（账面守恒）
+                settled_recon = reconciliations.settled_sum_conn(conn, tenant, order_id, refund_id)
+                if (award <= 0 or award > ticket["request_amount_cents"]
+                        or award > refund["amount_cents"] - settled_recon):
                     response = {"detail": "award amount is invalid or exceeds allowed amount"}
                     _save_idempotent(conn, tenant, request_id, op, order_id, refund_id, ticket_id, 409, response)
                     conn.execute("COMMIT")

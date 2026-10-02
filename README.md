@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额；以及退款单的受理、状态推进（完成/撤销）与冲正，内建请求级幂等与可退余额守恒；另支持针对退款单的工单争议链路：受理、逐级推进、裁决扣减与撤销关闭；并支持针对订单的结算单对账核销链路：受理占用未收余额、核销计入已收、撤销释放与冲正加回，含条件检索。数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额；以及退款单的受理、状态推进（完成/撤销）与冲正，内建请求级幂等与可退余额守恒；另支持针对退款单的工单争议链路：受理、逐级推进、裁决扣减与撤销关闭；并支持针对订单的结算单对账核销链路：受理占用未收余额、核销计入已收、撤销释放与冲正加回，含条件检索；以及针对退款单的对账单核销链路：受理占用未核销余额、核销计入已核销、撤销释放与冲正减回，含条件检索。数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -129,6 +129,42 @@ curl localhost:8000/orders/O-1/refunds/R-1 -H 'X-Tenant: acme'
 
 - `GET /health`：返回服务与数据库状态。
 
+### 对账单（退款单对账核销）
+
+租户均经请求头 `X-Tenant` 传入；写操作请求体携带 `request_id`（每次业务操作唯一），同一请求标识重放返回与首次完全一致的结果（含失败结果），不重复占用、扣减或释放；同一标识改作不同操作或对象返回 409。
+
+对账单针对已存在的退款单发起，以（订单标识，退款单标识，对账单标识）唯一。未核销金额 = 退款单金额 − 全部已生效（已核销）核销金额之和；受理即占用未核销余额，核销完成把核销金额计入已核销金额，撤销释放占用，冲正把已核销金额减回。任何步骤不得超过当时未核销余额，超限拒绝且不留部分写入。对账核销不调整订单已收/未收金额，也不改变退款单金额与生效扣减；退款单金额被已解决工单裁决扣减（或其撤销加回）后，未核销余额按上式重算，且已核销合计不得超过退款单当前金额（裁决扣减亦受此约束，超限 409）。
+
+状态机：`pending → settled → reversed`，`pending → cancelled`；三个终态均不可再推进，已核销不可撤销，冲正仅一次。
+
+- `POST /orders/{order_id}/refunds/{refund_id}/reconciliations`：受理对账单。请求字段 `reconciliation_id`、`amount_cents`（>0）、`reason`（非空）、`request_id`。成功返回 201 与对账单（`status=pending`、`effective_deduction_cents=0`）。退款单不存在/跨租户返回 404；同一退款单同一 `reconciliation_id` 重复受理、或金额超过当前未核销余额返回 409，且不改动既有数据。
+- `POST /orders/{order_id}/refunds/{refund_id}/reconciliations/{reconciliation_id}/settle`：推进为已核销。请求字段 `request_id`。核销金额计入该退款单已核销合计，对账单与退款单余额视图同事务原子生效；成功 200，响应附带 `refund_amount_cents` 与 `unreconciled_cents`。
+- `POST /orders/{order_id}/refunds/{refund_id}/reconciliations/{reconciliation_id}/cancel`：推进为已撤销（终态）。释放占用、不改已核销金额。
+- `POST /orders/{order_id}/refunds/{refund_id}/reconciliations/{reconciliation_id}/reverse`：对已核销单发起一次冲正，已核销金额减回，进入 `reversed` 终态，两侧原子生效。重复冲正、对冲正单/待核销单冲正返回 409。
+- `GET /orders/{order_id}/refunds/{refund_id}/reconciliations/{reconciliation_id}`：按标识读取对账单；跨租户或不存在返回 404。
+- `GET /orders/{order_id}/refunds/{refund_id}/reconciliations`：列出该退款单全部对账单（按受理先后）；退款单跨租户/不存在返回 404。
+- `GET /reconciliations?status=&min_amount_cents=&max_amount_cents=`：按状态与核销金额范围检索当前租户对账单（参数均可选，按受理先后稳定排序）；状态非法或区间倒置返回 400。
+
+单读、列表与检索的每个对账单对象给出：`order_id`、`refund_id`、`reconciliation_id`、`status`、`amount_cents`、`reason`、`effective_deduction_cents`（已核销为核销金额，其余为 0）。
+
+#### 调用示例
+
+```bash
+B=/orders/O-1/refunds/R-1/reconciliations
+# 受理对账单（核销金额 300，占用未核销余额）
+curl -X POST localhost:8000$B -H 'X-Tenant: acme' -H 'Content-Type: application/json' \
+  -d '{"reconciliation_id":"RC-1","amount_cents":300,"reason":"退款对账","request_id":"rc-acc-1"}'
+# 核销：计入已核销金额
+curl -X POST localhost:8000$B/RC-1/settle -H 'X-Tenant: acme' -H 'Content-Type: application/json' -d '{"request_id":"rc-st-1"}'
+# 冲正：已核销金额减回，进入已冲正终态
+curl -X POST localhost:8000$B/RC-1/reverse -H 'X-Tenant: acme' -H 'Content-Type: application/json' -d '{"request_id":"rc-rv-1"}'
+# 单读、列表与条件检索
+curl localhost:8000$B/RC-1 -H 'X-Tenant: acme'
+curl localhost:8000$B -H 'X-Tenant: acme'
+curl 'localhost:8000/reconciliations?status=pending&min_amount_cents=100&max_amount_cents=500' -H 'X-Tenant: acme'
+```
+
+
 ## 数据与配置
 
 - 数据库文件默认 `var/app.sqlite`（不入库）。
@@ -139,4 +175,4 @@ curl localhost:8000/orders/O-1/refunds/R-1 -H 'X-Tenant: acme'
 - 单进程运行，单库写入，未做连接池与写并发调优。
 - 租户通过请求头声明，未接入真实身份提供方。
 - 无缓存层；批量导入只支持小样本同步方式。
-- 收款只支持整单登记，未实现分期；结算单支持受理、核销、撤销与冲正，收款与结算单共同受未收余额守恒约束；退款单支持受理、完成、撤销与冲正，退款单金额仅可经由已解决工单的裁决扣减与其撤销加回调整。
+- 收款只支持整单登记，未实现分期；结算单支持受理、核销、撤销与冲正，收款与结算单共同受未收余额守恒约束；退款单支持受理、完成、撤销与冲正，退款单金额仅可经由已解决工单的裁决扣减与其撤销加回调整；对账单支持受理、核销、撤销与冲正，多张对账单共同受退款单未核销余额守恒约束。
