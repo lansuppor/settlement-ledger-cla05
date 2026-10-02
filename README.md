@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额，以及退款单的登记、读取、审核（同意/拒绝）与冲正（撤销）；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额、按业务身份回退收款，以及退款单的登记、读取、审核（同意/拒绝）与冲正（撤销）；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -22,6 +22,8 @@
 - `POST /orders`：受理订单。请求字段 `tenant`、`order_id`、`amount_cents`、`currency`。成功返回 201 与订单对象；参数不合法返回 400；同一租户重复受理返回 409。
 - `GET /orders/{order_id}`：按标识读取订单。租户通过请求头 `X-Tenant` 传入；不存在返回 404；跨租户读取返回 404（不泄漏对象是否存在）。
 - `POST /orders/{order_id}/payments`：登记收款。请求字段 `amount_cents`；超过未收金额返回 409；成功返回 200 与订单的 `paid_cents`、`outstanding_cents`。
+- `POST /payment-rollbacks`：收款回退（收错或重复收款时反向退回已收金额）。业务身份为（租户, `rollback_id`）。请求字段 `tenant`、`rollback_id`、`order_id`、`amount_cents`；`amount_cents` 为大于 0 的最小货币单位整数。成功返回 201 与回退结果，订单净已收相应调减；同一（租户, `rollback_id`）重复请求（即使金额/订单等请求指纹不同）不新建记录、不重复退回，返回 200 与既有结果。订单不存在或非本租户、金额非法、回退金额超过订单当前已收金额返回 400；回退会使退款占用额度（待审核 + 已生效未冲正退款）超过回退后已收金额、即超出剩余可回退额度时返回 409。回退记录写入与订单金额调整在同一事务内完成。
+- `GET /payment-rollbacks/{rollback_id}`：按回退标识读取回退结果。租户通过请求头 `X-Tenant` 传入；不存在或跨租户一律返回 404（不泄漏对象是否存在）。
 - `POST /orders/batch-accept`：批量受理订单。批次身份为（租户, `batch_id`）。支持两种提交形态：
   - `application/json`：请求字段 `tenant`、`batch_id`、`csv`（CSV 文本）。
   - 直接上传 CSV 文件（如 `Content-Type: text/csv`）：请求体即 CSV 字节，`tenant` 与 `batch_id` 通过查询参数传入（`?tenant=t1&batch_id=...`）。
@@ -36,7 +38,16 @@
 - `POST /refunds/{refund_id}/review`：审核退款单。请求头 `X-Tenant` 必传；请求字段 `decision`，取值 `approve` 或 `reject`。仅 `approve` 对订单生效；若生效会使退款总额超过订单已收金额返回 409。审核结果不可覆盖，重复审核返回原结果（200）；退款单已冲正后再审核返回 409；不存在或跨租户返回 404。
 - `POST /refunds/{refund_id}/reverse`：冲正（撤销）已生效退款单。请求头 `X-Tenant` 必传；将该笔已生效退款全额反向退回订单并把单据置为 `reversed`。仅对已 `approved` 的单据有效，待审核/已拒绝/已冲正均返回 409；不存在或跨租户返回 404。冲正后不得再次审核。
 
-退款单状态机：`pending`（待审核）→ `approved`（已同意并生效）/ `rejected`（已拒绝）；`approved` → `reversed`（已冲正，终态）。订单对外 `paid_cents` 为净已收（累计收款扣减已批准未冲正退款），`outstanding_cents = amount_cents − paid_cents` 恒成立。
+退款单状态机：`pending`（待审核）→ `approved`（已同意并生效）/ `rejected`（已拒绝）；`approved` → `reversed`（已冲正，终态）。订单对外 `paid_cents` 为净已收（累计收款扣减已批准未冲正退款，收款回退等额调减累计收款），`outstanding_cents = amount_cents − paid_cents` 恒成立。
+
+### 收款回退
+
+- `POST /payment-rollbacks`：回退已登记收款（收错、重复收款）。业务身份为（租户, 回退标识 `rollback_id`），请求须声明 `tenant`、`rollback_id`、`order_id`、`amount_cents`（大于 0 的最小货币单位整数）。
+- 回退在同一事务内写入回退记录并调减订单累计收款：对外已收按净额重新计算，未收金额仍等于订单金额减已收金额，已收金额始终落在 [0, 订单金额]。
+- 幂等以业务身份为准，与请求指纹无关：相同（租户, `rollback_id`）重复提交不新建回退记录、不重复退回金额，返回既有回退结果（HTTP 200），请求中的金额/订单差异被忽略。
+- 与退款额度口径相容：退款占用额度 = 待审核 + 已生效未冲正退款；回退后该占用不得超过回退后的订单已收（累计收款 − 已生效未冲正退款），否则返回 409 且不改变任何数据。回退金额超过订单当前已收金额返回 400。
+- 回退后退款仍按原规则登记、审核与冲正；回退与冲正任意交错后账务闭合：订单金额 = 已收 + 未收。回退腾出的未收额度可再次收款补齐。
+- `GET /payment-rollbacks/{rollback_id}` 读取回退结果，需 `X-Tenant` 头；跨租户读取或对非本租户订单执行回退一律按不存在处理（读取 404；执行时订单按参数错误 400），不泄漏对象是否存在。
 
 ### 批量受理
 
@@ -65,7 +76,7 @@
 - 单进程运行，单库写入，写事务以 `BEGIN IMMEDIATE` 串行执行，未做连接池与多实例扩展。
 - 租户通过请求头声明，未接入真实身份提供方。
 - 无缓存层；批量受理为同步逐行提交，适合中小文件，未做异步任务队列。
-- 退款支持逐笔登记、审核与冲正，未实现部分退款的分期审批流与对账报表。
+- 退款支持逐笔登记、审核与冲正，收款支持逐笔登记与按业务身份回退，未实现部分退款的分期审批流与对账报表。
 
 ## 调用示例
 
@@ -84,6 +95,16 @@ curl -s -X POST http://127.0.0.1:8000/refunds/rf-1/review \
 
 # 冲正：把已生效退款全额退回订单
 curl -s -X POST http://127.0.0.1:8000/refunds/rf-1/reverse -H 'X-Tenant: t1'
+```
+
+```bash
+# 收款回退（以租户 + rollback_id 为业务身份，可安全重试）
+curl -s -X POST http://127.0.0.1:8000/payment-rollbacks \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant":"t1","rollback_id":"rb-1","order_id":"demo-1","amount_cents":200}'
+
+# 读取回退结果（需 X-Tenant 头；跨租户一律 404）
+curl -s http://127.0.0.1:8000/payment-rollbacks/rb-1 -H 'X-Tenant: t1'
 ```
 
 ```bash

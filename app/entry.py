@@ -5,8 +5,10 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import batches, orders, refunds
+from app.store import batches, orders, payment_rollbacks, refunds
 from app.store.db import connect, migrate
+from app.store.payment_rollbacks import ConflictError as RollbackConflictError
+from app.store.payment_rollbacks import OrderNotFound as RollbackOrderNotFound
 from app.store.refunds import ConflictError, OrderNotFound
 from app.usecase import batch_import
 from app.usecase.batch_import import CsvFormatError
@@ -163,6 +165,43 @@ def read_refund(refund_id: str, x_tenant: str = Header(default="")) -> dict:
     if refund is None:
         raise HTTPException(status_code=404, detail="refund not found")
     return refund
+
+# ---------- 收款回退 ----------
+
+@app.post("/payment-rollbacks", status_code=201)
+async def register_payment_rollback(request: Request, response: Response) -> dict:
+    body = await _json_body(request)
+    tenant = body.get("tenant")
+    rollback_id = body.get("rollback_id")
+    order_id = body.get("order_id")
+    amount_cents = body.get("amount_cents")
+    if not (_non_empty_str(tenant) and _non_empty_str(rollback_id) and _non_empty_str(order_id)):
+        raise HTTPException(status_code=400, detail="tenant, rollback_id and order_id are required")
+    if not _positive_int(amount_cents):
+        raise HTTPException(status_code=400, detail="amount_cents must be a positive integer")
+
+    try:
+        rollback_record, created = payment_rollbacks.rollback(tenant, rollback_id, order_id, amount_cents)
+    except RollbackOrderNotFound:
+        # 订单不存在或不属于本租户统一按参数错误处理，不泄漏订单是否存在。
+        raise HTTPException(status_code=400, detail="order not found")
+    except RollbackConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    except ValueError as error:
+        # 回退金额超过订单当前已收金额等：参数错误，区别于冲突与内部错误。
+        raise HTTPException(status_code=400, detail=str(error))
+    if not created:
+        # 同一业务身份重复请求：不新建回退记录、不重复退回金额，返回既有结果（HTTP 200）。
+        response.status_code = 200
+    return rollback_record
+
+@app.get("/payment-rollbacks/{rollback_id}")
+def read_payment_rollback(rollback_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    rollback_record = payment_rollbacks.get(tenant, rollback_id)
+    if rollback_record is None:
+        raise HTTPException(status_code=404, detail="payment rollback not found")
+    return rollback_record
 
 @app.post("/refunds/{refund_id}/review")
 async def review_refund(refund_id: str, request: Request, x_tenant: str = Header(default="")) -> dict:
