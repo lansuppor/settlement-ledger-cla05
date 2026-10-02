@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额；以及退款单的受理、状态推进（完成/撤销）与冲正，内建请求级幂等与可退余额守恒。数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额；以及退款单的受理、状态推进（完成/撤销）与冲正，内建请求级幂等与可退余额守恒；另支持针对退款单的工单争议链路：受理、逐级推进、裁决扣减与撤销关闭。数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -36,6 +36,45 @@
 
 状态机：`pending → completed → reversed`，`pending → cancelled`；三个终态均不可再推进，已完成不可撤销。
 
+### 工单
+
+租户均经请求头 `X-Tenant` 传入；写操作请求体携带 `request_id`（每次业务操作唯一），同一请求标识重放返回与首次完全一致的结果（含失败结果），不重复扣减或释放。
+
+工单针对已存在且未终结（非 `cancelled`/`reversed`）的退款单发起，以（订单标识，退款单标识，工单标识）唯一。受理即对退款单施加「处理中」标记：一张退款单最多被一张进行中工单锁定；工单进行中（`accepted`/`processing`/`review`）期间，退款单的完成、撤销、冲正一律 409。工单受理不改变订单与退款单金额。
+
+状态机：`accepted → processing → review`（`review` 可回退 `processing`）；`processing|review → resolved`（落裁决金额，释放标记）；任意进行中状态或 `resolved` 可 `revoke` 到 `revoked`（释放标记；已解决撤销把裁决额加回退款单）。`resolved`/`revoked` 为终态。
+
+- `POST /orders/{order_id}/refunds/{refund_id}/tickets`：受理工单。请求字段 `ticket_id`、`request_amount_cents`（>0）、`initiator`、`reason`（非空）、`request_id`。成功返回 201 与工单对象（`ticket_id`、`status=accepted`、`request_amount_cents`、`initiator`、`effective_deduction_cents=0`）。退款单不存在/跨租户返回 404；同工单标识重复受理、退款单已撤销/已冲正、已有进行中工单返回 409，且不改任何数据。
+- `POST /orders/{order_id}/refunds/{refund_id}/tickets/{ticket_id}/process`：已受理→处理中。请求字段 `request_id`。
+- `POST /orders/{order_id}/refunds/{refund_id}/tickets/{ticket_id}/review`：处理中→待复核。
+- `POST /orders/{order_id}/refunds/{refund_id}/tickets/{ticket_id}/reprocess`：待复核→处理中（回退）。
+- `POST /orders/{order_id}/refunds/{refund_id}/tickets/{ticket_id}/resolve`：处理中/待复核→已解决（终态）。请求字段 `award_cents`（>0）、`request_id`。裁决金额须 ≤ 处理请求金额且 ≤ 退款单当前金额，否则 409 且不改数据。成功后退款单金额按裁决额扣减；已完成退款单的生效扣减同步为扣减后金额（待处理单仍为 0，完成时才生效）；订单金额不变。
+- `POST /orders/{order_id}/refunds/{refund_id}/tickets/{ticket_id}/revoke`：撤销关闭。进行中撤销只释放标记、不动金额；已解决撤销把裁决金额加回退款单并恢复生效扣减，进入 `revoked` 终态（每张工单只能从已解决撤销一次）。
+- `GET /orders/{order_id}/refunds/{refund_id}/tickets/{ticket_id}`：按标识读取工单；跨租户或不存在返回 404。
+- `GET /orders/{order_id}/refunds/{refund_id}/tickets`：按退款单列出其全部工单（按受理先后），返回 `tickets` 数组；退款单跨租户/不存在返回 404。
+
+单读与列表的每个工单对象给出：`ticket_id`、`status`、`request_amount_cents`、`initiator`、`effective_deduction_cents`（已解决为裁决金额，其余为 0）。
+
+#### 调用示例
+
+```bash
+B=/orders/O-1/refunds/R-1/tickets
+# 受理工单（R-1 须为 pending/completed 的退款单）
+curl -X POST localhost:8000$B -H 'X-Tenant: acme' -H 'Content-Type: application/json' \
+  -d '{"ticket_id":"T-1","request_amount_cents":300,"initiator":"alice","reason":"货不对版","request_id":"w-acc-1"}'
+# 逐级推进
+curl -X POST localhost:8000$B/T-1/process -H 'X-Tenant: acme' -H 'Content-Type: application/json' -d '{"request_id":"w-p-1"}'
+curl -X POST localhost:8000$B/T-1/review  -H 'X-Tenant: acme' -H 'Content-Type: application/json' -d '{"request_id":"w-rv-1"}'
+# 裁决 120：扣减退款单金额（≤ 请求金额 300、≤ 退款金额）
+curl -X POST localhost:8000$B/T-1/resolve -H 'X-Tenant: acme' -H 'Content-Type: application/json' \
+  -d '{"award_cents":120,"request_id":"w-rs-1"}'
+# 已解决可撤销一次：金额加回退款单
+curl -X POST localhost:8000$B/T-1/revoke  -H 'X-Tenant: acme' -H 'Content-Type: application/json' -d '{"request_id":"w-rk-1"}'
+# 单读与列表
+curl localhost:8000$B/T-1 -H 'X-Tenant: acme'
+curl localhost:8000$B -H 'X-Tenant: acme'
+```
+
 #### 调用示例
 
 ```bash
@@ -65,4 +104,4 @@ curl localhost:8000/orders/O-1/refunds/R-1 -H 'X-Tenant: acme'
 - 单进程运行，单库写入，未做连接池与写并发调优。
 - 租户通过请求头声明，未接入真实身份提供方。
 - 无缓存层；批量导入只支持小样本同步方式。
-- 收款只支持整单登记，未实现分期与对账；退款单支持受理、完成、撤销与冲正，尚不支持退款单的部分金额修改。
+- 收款只支持整单登记，未实现分期与对账；退款单支持受理、完成、撤销与冲正，退款单金额仅可经由已解决工单的裁决扣减与其撤销加回调整。

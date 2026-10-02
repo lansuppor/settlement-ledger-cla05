@@ -1,6 +1,7 @@
 import json
 import sqlite3
 
+from app.store import tickets
 from app.store.db import connect
 
 # 退款单状态机：
@@ -164,6 +165,13 @@ def _advance(
                 conn.execute("COMMIT")
                 return 404, response
 
+            # 工单进行中（已受理/处理中/待复核）期间，退款单不得完成或撤销
+            if tickets.active_ticket_exists(conn, tenant, order_id, refund_id):
+                response = {"detail": "refund is locked by an in-progress ticket"}
+                _save_idempotent(conn, tenant, request_id, op, order_id, refund_id, 409, response)
+                conn.execute("COMMIT")
+                return 409, response
+
             if refund["status"] == target_status:
                 response = {"detail": f"refund already {target_status}"}
                 _save_idempotent(conn, tenant, request_id, op, order_id, refund_id, 409, response)
@@ -235,6 +243,13 @@ def reverse(tenant: str, order_id: str, refund_id: str, request_id: str) -> tupl
                 _save_idempotent(conn, tenant, request_id, OP_REVERSE, order_id, refund_id, 404, response)
                 conn.execute("COMMIT")
                 return 404, response
+
+            # 工单进行中期间，退款单不得冲正
+            if tickets.active_ticket_exists(conn, tenant, order_id, refund_id):
+                response = {"detail": "refund is locked by an in-progress ticket"}
+                _save_idempotent(conn, tenant, request_id, OP_REVERSE, order_id, refund_id, 409, response)
+                conn.execute("COMMIT")
+                return 409, response
 
             if refund["status"] == REVERSED:
                 response = {"detail": "refund already reversed"}
