@@ -90,6 +90,50 @@ def _order_view(conn: sqlite3.Connection, tenant: str, order_id: str) -> dict:
     return {"paid_cents": row["paid_cents"], "outstanding_cents": row["amount_cents"] - row["paid_cents"]}
 
 
+def _accept_conn(
+    conn: sqlite3.Connection, tenant: str, order_id: str, refund_id: str, amount_cents: int
+) -> tuple[str, dict | None]:
+    """在调用方已持有的写事务内按单笔受理规则判定并落库（受理即占用可退余额）。
+
+    成功返回 ("ok", 退款单视图)；失败返回 (原因码, None)：
+      order_not_found / duplicate_refund / exceeds_refundable_balance。
+    金额合法性由调用方先行判定（批量导入需逐行给出金额非法原因）。
+    """
+    order = conn.execute(
+        "SELECT amount_cents, paid_cents FROM orders WHERE tenant=? AND order_id=?",
+        (tenant, order_id),
+    ).fetchone()
+    if order is None:
+        return "order_not_found", None
+
+    if _get_refund_conn(conn, tenant, order_id, refund_id) is not None:
+        return "duplicate_refund", None
+
+    # 守恒不变量：待处理占用 + 已生效扣减（已体现在 paid_cents 的扣减中）<= 累计已收
+    row = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents),0) AS pending_sum FROM refunds"
+        " WHERE tenant=? AND order_id=? AND status='pending'",
+        (tenant, order_id),
+    ).fetchone()
+    if amount_cents <= 0 or row["pending_sum"] + amount_cents > order["paid_cents"]:
+        return "exceeds_refundable_balance", None
+
+    conn.execute(
+        "INSERT INTO refunds(tenant, order_id, refund_id, amount_cents, status,"
+        " effective_deduction_cents, created_at, updated_at)"
+        " VALUES(?,?,?,?,'pending',0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        (tenant, order_id, refund_id, amount_cents),
+    )
+    return "ok", _row_to_refund(_get_refund_conn(conn, tenant, order_id, refund_id))
+
+
+_ACCEPT_FAILURES = {
+    "order_not_found": (404, {"detail": "order not found"}),
+    "duplicate_refund": (409, {"detail": "refund already accepted"}),
+    "exceeds_refundable_balance": (409, {"detail": "refund exceeds refundable balance"}),
+}
+
+
 def accept(tenant: str, order_id: str, refund_id: str, amount_cents: int, request_id: str) -> tuple[int, dict]:
     conn = connect()
     try:
@@ -100,45 +144,14 @@ def accept(tenant: str, order_id: str, refund_id: str, amount_cents: int, reques
                 conn.execute("ROLLBACK")
                 return replay
 
-            order = conn.execute(
-                "SELECT amount_cents, paid_cents FROM orders WHERE tenant=? AND order_id=?",
-                (tenant, order_id),
-            ).fetchone()
-            if order is None:
-                response = {"detail": "order not found"}
-                _save_idempotent(conn, tenant, request_id, OP_ACCEPT, order_id, refund_id, 404, response)
-                conn.execute("COMMIT")
-                return 404, response
-
-            existing = _get_refund_conn(conn, tenant, order_id, refund_id)
-            if existing is not None:
-                response = {"detail": "refund already accepted"}
-                _save_idempotent(conn, tenant, request_id, OP_ACCEPT, order_id, refund_id, 409, response)
-                conn.execute("COMMIT")
-                return 409, response
-
-            # 守恒不变量：待处理占用 + 已生效扣减（已体现在 paid_cents 的扣减中）<= 累计已收
-            row = conn.execute(
-                "SELECT COALESCE(SUM(amount_cents),0) AS pending_sum FROM refunds"
-                " WHERE tenant=? AND order_id=? AND status='pending'",
-                (tenant, order_id),
-            ).fetchone()
-            if amount_cents <= 0 or row["pending_sum"] + amount_cents > order["paid_cents"]:
-                response = {"detail": "refund exceeds refundable balance"}
-                _save_idempotent(conn, tenant, request_id, OP_ACCEPT, order_id, refund_id, 409, response)
-                conn.execute("COMMIT")
-                return 409, response
-
-            conn.execute(
-                "INSERT INTO refunds(tenant, order_id, refund_id, amount_cents, status,"
-                " effective_deduction_cents, created_at, updated_at)"
-                " VALUES(?,?,?,?,'pending',0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-                (tenant, order_id, refund_id, amount_cents),
-            )
-            refund = _row_to_refund(_get_refund_conn(conn, tenant, order_id, refund_id))
-            _save_idempotent(conn, tenant, request_id, OP_ACCEPT, order_id, refund_id, 201, refund)
+            reason, refund = _accept_conn(conn, tenant, order_id, refund_id, amount_cents)
+            if reason == "ok":
+                http_status, response = 201, refund
+            else:
+                http_status, response = _ACCEPT_FAILURES[reason]
+            _save_idempotent(conn, tenant, request_id, OP_ACCEPT, order_id, refund_id, http_status, response)
             conn.execute("COMMIT")
-            return 201, refund
+            return http_status, response
         except RefundConflict:
             conn.execute("ROLLBACK")
             raise
