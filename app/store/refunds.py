@@ -1,7 +1,7 @@
 import json
 import sqlite3
 
-from app.store import tickets
+from app.store import refund_imports, tickets
 from app.store.db import connect
 
 # 退款单状态机：
@@ -67,6 +67,9 @@ def _replay_or_none(
     """命中幂等记录则返回首次结果；同 request_id 指向不同操作/对象则冲突。"""
     recorded = _load_idempotent(conn, tenant, request_id)
     if recorded is None:
+        # request_id 已被退款单批量导入占用：改作单笔操作视为不同操作冲突
+        if refund_imports.request_exists(conn, tenant, request_id) is not None:
+            raise RefundConflict("request_id was already used for a different operation")
         return None
     saved_op, saved_order, saved_refund, http_status, response = recorded
     if (saved_op, saved_order, saved_refund) != (op, order_id, refund_id):

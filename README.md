@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额；以及退款单的受理、状态推进（完成/撤销）与冲正，内建请求级幂等与可退余额守恒；另支持针对退款单的工单争议链路：受理、逐级推进、裁决扣减与撤销关闭；并支持针对订单的结算单对账核销链路：受理占用未收余额、核销计入已收、撤销释放与冲正加回，含条件检索；以及针对退款单的对账单对账核销链路：受理占用未核销余额、核销计入已核销、撤销释放与冲正减回，含条件检索且全程不改动订单与退款单金额。数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额；以及退款单的受理、状态推进（完成/撤销）与冲正，内建请求级幂等与可退余额守恒；另支持针对退款单的工单争议链路：受理、逐级推进、裁决扣减与撤销关闭；并支持针对订单的结算单对账核销链路：受理占用未收余额、核销计入已收、撤销释放与冲正加回，含条件检索；以及针对退款单的对账单对账核销链路：受理占用未核销余额、核销计入已核销、撤销释放与冲正减回，含条件检索且全程不改动订单与退款单金额；另支持退款单批量导入：逐行校验、部分成功、错误清单与断点续跑。数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -127,6 +127,44 @@ curl localhost:8000/orders/O-1/refunds -H 'X-Tenant: acme'
 curl localhost:8000/orders/O-1/refunds/R-1 -H 'X-Tenant: acme'
 ```
 
+### 退款单批量导入
+
+租户经请求头 `X-Tenant` 传入；整批以请求体 `request_id`（批次请求标识）幂等。导入是提交一批**待受理**退款单，每行给出 `order_id`、`refund_id`、`amount_cents`，以（订单标识，退款单标识）唯一确定一张退款单。
+
+- 逐行独立判定，一行失败不影响其他行：成功行按单笔受理规则真正落库（`status=pending`、占用可退余额），失败行不留下任何退款单写入。行内规则与单笔受理完全一致：金额须为正整数（`invalid_amount`），`order_id`/`refund_id` 须为非空字符串（`invalid_line`），订单须存在且属于当前租户（`order_not_found`），（订单，退款单）不得重复受理（`duplicate_refund`），金额不得超过当前可退余额（`exceeds_refundable_balance`；该订单上待处理退款单金额之和——含本批此前已生效行——不得超过已收金额）。
+- `POST /refund-imports`：提交/续跑批次。请求字段 `request_id`、`lines`（非空数组，每项含 `order_id`、`refund_id`、`amount_cents`；非法字段类型不作为整请求 422，而是该行失败原因）。始终返回 200 与批次结果（部分成功亦 200）：`request_id`、`status`（`in_progress`/`completed`）、`total`、`accepted_count`、`rejected_count`、`rows`。每个 `rows[i]` 给出 `position`（从 0 起、按提交顺序稳定）、`order_id`、`refund_id`、`amount_cents`、`outcome`（`accepted`/`rejected`），成功行附 `refund` 对象，失败行附 `error_code` 与 `reason`。
+- 幂等与冲突：同一 `request_id` 重放（请求体一致）返回与首次完全一致的结果（含各行成败与原因），不重复受理任何行；同一 `request_id` 提交不同批次内容返回 409；批量导入与单笔退款受理共享 `request_id` 命名空间，同标识在两类操作间混用返回 409。
+- 断点续跑：中断后用**同一 `request_id` 与同一批数据**重新 `POST` 即可续跑；已生效行不重复受理，已判失败行原因不变，最终成功行集合与错误清单和一次跑完逐行一致。中断期间也可读取检查点进度。
+- `GET /refund-imports/{request_id}`：按批次请求标识查询结果（含中断态 `in_progress`），按提交顺序排列；跨租户或不存在返回 404。
+- 导入生成的退款单沿用现有入口：`GET /orders/{order_id}/refunds/{refund_id}` 单读、`GET /orders/{order_id}/refunds` 按订单列出，并可正常完成/撤销/冲正。
+
+#### 调用示例
+
+```bash
+# 提交一批：部分成功（始终 200，逐行看 outcome）
+curl -X POST localhost:8000/refund-imports -H 'X-Tenant: acme' -H 'Content-Type: application/json' -d '{
+  "request_id": "batch-20261003-01",
+  "lines": [
+    {"order_id":"O-1","refund_id":"R-1","amount_cents":300},
+    {"order_id":"O-1","refund_id":"R-2","amount_cents":0},
+    {"order_id":"O-2","refund_id":"R-3","amount_cents":50}
+  ]
+}'
+# 重放 / 中断后续跑：同一 request_id 与同一批数据，结果逐行一致
+curl -X POST localhost:8000/refund-imports -H 'X-Tenant: acme' -H 'Content-Type: application/json' -d '{
+  "request_id": "batch-20261003-01",
+  "lines": [
+    {"order_id":"O-1","refund_id":"R-1","amount_cents":300},
+    {"order_id":"O-1","refund_id":"R-2","amount_cents":0},
+    {"order_id":"O-2","refund_id":"R-3","amount_cents":50}
+  ]
+}'
+# 查询批次结果
+curl localhost:8000/refund-imports/batch-20261003-01 -H 'X-Tenant: acme'
+# 导入生成的退款单走既有读取/推进入口
+curl localhost:8000/orders/O-1/refunds/R-1 -H 'X-Tenant: acme'
+```
+
 - `GET /health`：返回服务与数据库状态。
 
 ## 对账单（退款单对账核销）
@@ -173,5 +211,5 @@ curl 'localhost:8000/reconciliations?status=pending&min_amount_cents=100&max_amo
 
 - 单进程运行，单库写入，未做连接池与写并发调优。
 - 租户通过请求头声明，未接入真实身份提供方。
-- 无缓存层；批量导入只支持小样本同步方式。
+- 无缓存层；退款单批量导入为小样本同步方式（逐行独立事务提交，支持中断续跑），未做异步分片。
 - 收款只支持整单登记，未实现分期；结算单支持受理、核销、撤销与冲正，收款与结算单共同受未收余额守恒约束；退款单支持受理、完成、撤销与冲正，退款单金额仅可经由已解决工单的裁决扣减与其撤销加回调整；对账单支持受理、核销、撤销与冲正，只在退款单未核销余额内占用/核销/减回，不改动订单与退款单金额。

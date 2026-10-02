@@ -5,9 +5,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import orders, reconciliations, refunds, settlements, tickets
+from app.store import orders, reconciliations, refund_imports, refunds, settlements, tickets
 from app.store.db import connect, migrate
 from app.store.reconciliations import ReconciliationConflict
+from app.store.refund_imports import RefundImportConflict
 from app.store.refunds import RefundConflict
 from app.store.settlements import SettlementConflict
 from app.store.tickets import TicketConflict
@@ -30,6 +31,10 @@ def ticket_conflict_handler(_request: Request, exc: TicketConflict) -> JSONRespo
 def reconciliation_conflict_handler(_request: Request, exc: ReconciliationConflict) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
+@app.exception_handler(RefundImportConflict)
+def refund_import_conflict_handler(_request: Request, exc: RefundImportConflict) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
 class OrderIn(BaseModel):
     tenant: str = Field(min_length=1)
     order_id: str = Field(min_length=1)
@@ -46,6 +51,11 @@ class RefundIn(BaseModel):
 
 class RefundActionIn(BaseModel):
     request_id: str = Field(min_length=1)
+
+class RefundImportIn(BaseModel):
+    request_id: str = Field(min_length=1)
+    # 逐行宽容解析：非对象行、非法字段类型不在请求层拒绝，而作为该行的失败原因返回
+    lines: list[object] = Field(min_length=1)
 
 class TicketIn(BaseModel):
     ticket_id: str = Field(min_length=1)
@@ -167,6 +177,23 @@ def list_refunds(order_id: str, x_tenant: str = Header(default="")) -> dict:
     if items is None:
         raise HTTPException(status_code=404, detail="order not found")
     return {"order_id": order_id, "refunds": items}
+
+# ---- 退款单批量导入 ----
+
+@app.post("/refund-imports")
+def submit_refund_import(body: RefundImportIn, x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    lines = [line if isinstance(line, dict) else {} for line in body.lines]
+    status, payload = refund_imports.submit(tenant, body.request_id, lines)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.get("/refund-imports/{request_id}")
+def read_refund_import(request_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    result = refund_imports.get(tenant, request_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="import batch not found")
+    return result
 
 # ---- 工单 ----
 
