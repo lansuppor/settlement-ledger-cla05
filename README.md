@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额、收款回退（登记后发现收错或重复收款时反向退回），以及退款单的登记、读取、审核（同意/拒绝）与冲正（撤销）；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额、收款回退（登记后发现收错或重复收款时反向退回），退款单的登记、读取、审核（同意/拒绝）与冲正（撤销），以及订单对账核销（把账务流水与订单当前金额的核对结论固化为不可变更、可查询的对账单）；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -36,6 +36,8 @@
   - 直接上传 CSV 文件（如 `Content-Type: text/csv`）：请求体即 CSV 字节，`tenant` 与 `batch_id` 通过查询参数传入（`?tenant=t1&batch_id=...`）。
   - CSV 表头必须恰为 `tenant,order_id,amount_cents,currency`，字段口径与单笔受理一致。首次处理返回 201 与批次结果；同一（租户, `batch_id`）重放返回 200 与既有结果，不重复受理任何订单。CSV 格式非法（缺表头、列数不符、编码非法、行结构损坏）整批拒绝返回 400 且不受理任何行；行业务校验失败只跳过该行并计入错误清单。进行中批次只接受同一份输入续跑，输入不一致返回 409。
 - `GET /batches/{batch_id}`：按批次标识查询批次结果。租户通过请求头 `X-Tenant` 传入；不存在或跨租户一律返回 404（不泄漏批次是否存在）。
+- `POST /reconciliations`：发起订单对账核销（见“订单对账核销”）。请求字段 `tenant`、`reconcile_id` 与对账范围；首次成功返回 201 与对账单，同一（租户, `reconcile_id`）重复提交返回 200 与既有对账单，不重新核对、不改变既有结论（与本次携带的范围指纹无关）。范围非法或范围下没有任何订单返回 400。
+- `GET /reconciliations/{reconcile_id}`：按标识读取对账单。租户通过请求头 `X-Tenant` 传入；不存在或跨租户一律返回 404（不泄漏对账单是否存在）。
 - `GET /health`：返回服务与数据库状态。
 
 ### 退款单
@@ -83,6 +85,23 @@
 - 返回 `entries`（按 `seq` 升序）、`page_size`、`next_cursor`、`has_next`；末页 `has_next` 为假且 `next_cursor` 为空。无新动作时每次读取顺序与内容一致；查询在单个只读事务、同一份已提交快照内完成，并发动作落库后后续查询看到其完整流水，绝不出现半条记录。
 - 订单受理不是账务动作，不产生流水；刚受理、尚无账务动作的订单返回空流水页。
 
+### 订单对账核销
+
+对账把账务流水与订单当前金额的核对结论固化为一张可查询、不可变更的对账单，回答某个时点账面是否闭合、差异出在哪一笔。对账以（租户, `reconcile_id`）为业务身份。
+
+- 发起：`POST /reconciliations`，请求字段 `tenant`、`reconcile_id` 与对账范围。范围可三选一并取交集（至少声明一种）：
+  - `order_id`：单张订单（非空字符串）；
+  - 订单金额区间：`amount_min`/`amount_max`；
+  - 未收金额区间：`outstanding_min`/`outstanding_max`（金额口径与订单读取一致，未收 = 订单金额 − 净已收）。
+  - 区间端点含边界、可只给一侧，必须是非负整数；端点非法、下限大于上限、未声明任何范围形态、或范围下没有任何订单（含单张订单不存在/非本租户）均返回 400，与 500 区分，且不留下半张对账单。
+- 核对在一次数据库事务、同一份已提交快照内完成，对范围内每张订单给出：订单金额、对外已收金额（净已收，口径与订单对象一致）、未收金额、逐条流水（含逐条累计的 `expected_balance_cents` 与衔接结论 `chained`）、`chain_intact`（余额衔接是否完整）、`final_balance_matches_paid`（末条流水余额是否等于当前已收；无流水时末余额按 0 计）、`amount_closed`（订单金额 = 已收 + 未收且已收落在 [0, 订单金额]）。
+- 对账单状态：每张订单都“逐条衔接、末条余额等于当前已收、金额闭合”时为 `reconciled`（已核销）；任一订单不满足即为 `discrepancy`（有差异）。差异清单 `discrepancies` 逐张订单给出 `order_id`、`reasons`（`balance_chain_broken` 余额衔接断链 / `final_balance_mismatch` 末条余额与当前已收不一致 / `amount_not_closed` 金额不闭合，可并存）、断链流水 `broken_entry_seqs`、末条流水余额 `last_balance_cents` 与当前已收 `current_paid_cents`。
+- 不可变与幂等：同一（租户, `reconcile_id`）重复提交不重新核对、不改变既有结论，返回首张对账单（HTTP 200），即使本次携带完全不同的范围、或此后订单数据已经变化；不同 `reconcile_id` 各自得到独立的一张，核对时点即首次提交的已提交快照。并发下多个客户端用不同标识同时核对同一范围，各自得到独立且自洽的结论；并发提交同一标识恰好生成一张（一张 201，其余 200）。
+- 对账过程为纯读取：不改变任何订单、收款、收款回退、退款与流水数据，唯一写入是对账单结论本身。对账单持久化落库，服务重启后按标识重读结论一致。
+- 读取：`GET /reconciliations/{reconcile_id}`，租户由请求头 `X-Tenant` 传入，缺失租户头返回 400；不存在或跨租户一律 404，不泄漏对账单是否存在。
+- 返回字段：`reconcile_id`、`status`（`reconciled`/`discrepancy`）、`order_count`（核对订单总数）、`discrepancy_count`（差异订单数）、`orders`（逐订单核对结果，按订单标识升序）、`discrepancies`（差异清单）、`scope`（首次提交的范围留痕）、`reconciled_at`（核对时点，UTC，由数据库生成）。
+- 对账能力不改变既有订单受理、读取、收款、退款单登记/审核/冲正、收款回退、批量受理、条件检索与账务流水的任何行为。
+
 ### 批量受理
 
 批次结果字段：
@@ -110,7 +129,7 @@
 - 单进程运行，单库写入，写事务以 `BEGIN IMMEDIATE` 串行执行，未做连接池与多实例扩展。
 - 租户通过请求头声明，未接入真实身份提供方。
 - 无缓存层；批量受理为同步逐行提交，适合中小文件，未做异步任务队列。
-- 退款支持逐笔登记、审核与冲正，未实现部分退款的分期审批流与对账报表。
+- 退款支持逐笔登记、审核与冲正，未实现部分退款的分期审批流。
 
 ## 调用示例
 
@@ -155,6 +174,21 @@ curl -s 'http://127.0.0.1:8000/orders/demo-1/account-entries?page_size=20' -H 'X
 
 # 用上一页返回的 next_cursor（末条流水的 seq）继续翻页
 curl -s 'http://127.0.0.1:8000/orders/demo-1/account-entries?page_size=20&cursor=8' -H 'X-Tenant: t1'
+```
+
+```bash
+# 发起对账（单张订单；首次 201，同一 tenant+reconcile_id 重放 200 且结论不变）
+curl -s -X POST http://127.0.0.1:8000/reconciliations \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant":"t1","reconcile_id":"rec-20261002","order_id":"demo-1"}'
+
+# 发起对账（订单金额与未收金额区间取交集，端点含边界，可只给一侧）
+curl -s -X POST http://127.0.0.1:8000/reconciliations \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant":"t1","reconcile_id":"rec-range","amount_min":100,"outstanding_min":0,"outstanding_max":500}'
+
+# 读取对账单（需 X-Tenant 头；不存在或跨租户一律 404）
+curl -s http://127.0.0.1:8000/reconciliations/rec-20261002 -H 'X-Tenant: t1'
 ```
 
 ```bash
