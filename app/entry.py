@@ -6,8 +6,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import orders, reconciliations, refund_imports, refunds, settlements, tickets
+from app.store import inventory, orders, reconciliations, refund_imports, refunds, settlements, tickets
 from app.store.db import connect, migrate
+from app.store.inventory import InventoryConflict
 from app.store.reconciliations import ReconciliationConflict
 from app.store.refund_imports import RefundImportConflict
 from app.store.refunds import RefundConflict
@@ -34,6 +35,10 @@ def reconciliation_conflict_handler(_request: Request, exc: ReconciliationConfli
 
 @app.exception_handler(RefundImportConflict)
 def refund_import_conflict_handler(_request: Request, exc: RefundImportConflict) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+@app.exception_handler(InventoryConflict)
+def inventory_conflict_handler(_request: Request, exc: InventoryConflict) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 class OrderIn(BaseModel):
@@ -88,6 +93,17 @@ class SettlementIn(BaseModel):
     request_id: str = Field(min_length=1)
 
 class SettlementActionIn(BaseModel):
+    request_id: str = Field(min_length=1)
+
+class InventoryDocIn(BaseModel):
+    doc_id: str = Field(min_length=1)
+    warehouse_id: str = Field(min_length=1)
+    item_id: str = Field(min_length=1)
+    direction: str = Field(min_length=1)
+    quantity: int
+    request_id: str = Field(min_length=1)
+
+class InventoryDocActionIn(BaseModel):
     request_id: str = Field(min_length=1)
 
 def _require_tenant(x_tenant: str) -> str:
@@ -389,6 +405,50 @@ def search_settlements(status: str = "", min_amount_cents: int | None = None,
         max_amount_cents=max_amount_cents,
     )
     return {"settlements": items}
+
+# ---- 出入库单与库存余额 ----
+
+@app.post("/inventory-docs", status_code=201)
+def create_inventory_doc(body: InventoryDocIn, x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    status, payload = inventory.accept(
+        tenant, body.doc_id, body.warehouse_id, body.item_id,
+        body.direction, body.quantity, body.request_id)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.post("/inventory-docs/{doc_id}/post")
+def post_inventory_doc(doc_id: str, body: InventoryDocActionIn, x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    status, payload = inventory.post(tenant, doc_id, body.request_id)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.post("/inventory-docs/{doc_id}/cancel")
+def cancel_inventory_doc(doc_id: str, body: InventoryDocActionIn, x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    status, payload = inventory.cancel(tenant, doc_id, body.request_id)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.post("/inventory-docs/{doc_id}/reverse")
+def reverse_inventory_doc(doc_id: str, body: InventoryDocActionIn, x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    status, payload = inventory.reverse(tenant, doc_id, body.request_id)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.get("/inventory-docs/{doc_id}")
+def read_inventory_doc(doc_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    doc = inventory.get(tenant, doc_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    return doc
+
+@app.get("/inventory-balance")
+def read_inventory_balance(warehouse_id: str = "", item_id: str = "",
+                           x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    if not warehouse_id or not item_id:
+        raise HTTPException(status_code=400, detail="warehouse_id and item_id are required")
+    return inventory.get_balance(tenant, warehouse_id, item_id)
 
 def main() -> None:
     parser = argparse.ArgumentParser()

@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额；以及退款单的受理、状态推进（完成/撤销）与冲正，内建请求级幂等与可退余额守恒；另支持针对退款单的工单争议链路：受理、逐级推进、裁决扣减与撤销关闭；并支持针对订单的结算单对账核销链路：受理占用未收余额、核销计入已收、撤销释放与冲正加回，含条件检索；以及针对退款单的对账单对账核销链路：受理占用未核销余额、核销计入已核销、撤销释放与冲正减回，含条件检索且全程不改动订单与退款单金额；另支持退款单批量导入：逐行校验、部分成功、错误清单、批次幂等与断点续跑，与逐单受理共用同一套可退余额守恒与租户隔离规则。数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额；以及退款单的受理、状态推进（完成/撤销）与冲正，内建请求级幂等与可退余额守恒；另支持针对退款单的工单争议链路：受理、逐级推进、裁决扣减与撤销关闭；并支持针对订单的结算单对账核销链路：受理占用未收余额、核销计入已收、撤销释放与冲正加回，含条件检索；以及针对退款单的对账单对账核销链路：受理占用未核销余额、核销计入已核销、撤销释放与冲正减回，含条件检索且全程不改动订单与退款单金额；另支持退款单批量导入：逐行校验、部分成功、错误清单、批次幂等与断点续跑，与逐单受理共用同一套可退余额守恒与租户隔离规则；另支持按租户隔离的出入库单与库存余额：受理、入账、撤销、冲正、按单号读取与按仓库商品读取余额，出库受理即占用可用数量，余额由单据流水推导且三者（账面/占用/可用）不为负。数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -199,8 +199,51 @@ curl localhost:8000$B -H 'X-Tenant: acme'
 curl 'localhost:8000/reconciliations?status=pending&min_amount_cents=100&max_amount_cents=500' -H 'X-Tenant: acme'
 ```
 
-## 数据与配置
+## 出入库单与库存余额
 
+租户均经请求头 `X-Tenant` 传入（缺租户头返回 400）；写操作请求体携带 `request_id`（每次业务操作唯一），同一租户内相同标识且操作、对象、参数完全相同的重放返回首次业务结果（含业务拒绝），不重复占用或改动库存；同一标识改作其他操作、对象或参数返回 409。
+
+每张出入库单记载：单号 `doc_id`（租户内唯一）、仓库标识 `warehouse_id`、商品标识 `item_id`（均非空文本）、方向 `direction`（`inbound` 入库 / `outbound` 出库）、正整数数量 `quantity`。不预设商品目录与期初库存：未发生入账的（仓库， 商品）余额为零。跨租户读取或操作已有单据按不存在处理（404）。
+
+状态机：`pending → posted → reversed`，`pending → cancelled`；`cancelled`/`reversed` 为终态。只有待入账单可入账或撤销，只有已入账单可冲正一次；非法推进返回 409 且不改单据与余额。
+
+- 受理后单据为待入账：待入账入库不增加库存；待入账出库立即占用可用数量，超出可用数量的受理拒绝。
+- 入账：入库增加账面数量；出库把占用转为账面扣减（占用与账面同步减）。
+- 撤销：释放出库占用，不改账面数量。
+- 冲正：消除原入账效果——冲正出库把数量加回账面；冲正入库从账面减回，若会使账面低于待入账出库占用则拒绝且保持原状态。
+
+余额按（租户， 仓库， 商品）由单据流水推导：`book_quantity`（账面数量）= 已入账入库 − 已入账出库；`reserved_quantity`（待入账出库占用）；`available_quantity`（可用数量）= 账面 − 占用，三者不为负。竞争同一可用库存时只允许可用量内的请求成功（单写事务串行判定），绝不出现负库存。成功时单据、余额变化与请求结果在同一事务原子落库；业务拒绝只落可重放的请求结果；重启后单据状态、占用与请求结果均可继续读取。
+
+- `POST /inventory-docs`：受理出入库单。请求字段 `doc_id`、`warehouse_id`、`item_id`、`direction`、`quantity`、`request_id`。成功返回 201 与单据对象及当前 `balance`。拒绝均返回 409 并以 `reason` 区分原因：`invalid_quantity`（数量非正整数）、`invalid_direction`（方向非法）、`invalid_identifier`（仓库/商品标识为空）、`duplicate_doc`（单号重复受理）、`insufficient_available`（出库超过可用数量）；请求体缺字段或类型错误返回 422。
+- `POST /inventory-docs/{doc_id}/post`：待入账→已入账。请求字段 `request_id`。成功 200；单据不存在（含跨租户）返回 404（`reason=doc_not_found`）；状态非法返回 409（`reason=invalid_state`）。
+- `POST /inventory-docs/{doc_id}/cancel`：待入账→已撤销（终态）。释放出库占用，不改账面。
+- `POST /inventory-docs/{doc_id}/reverse`：已入账→已冲正（终态，仅一次）。冲正入库若使账面低于待入账出库占用返回 409（`reason=insufficient_book`）且保持原状态。
+- `GET /inventory-docs/{doc_id}`：按单号读取单据；跨租户或不存在返回 404。
+- `GET /inventory-balance?warehouse_id=&item_id=`：按仓库与商品读取余额（`book_quantity`、`reserved_quantity`、`available_quantity`）；未发生任何单据时三项为零；缺参数返回 400。
+
+单读与写操作响应中的单据对象给出：`doc_id`、`warehouse_id`、`item_id`、`direction`、`quantity`、`status`；写操作响应另附该（仓库， 商品）的 `balance`。
+
+### 调用示例
+
+```bash
+H='-H "X-Tenant: acme" -H "Content-Type: application/json"'
+# 受理入库单（待入账，不增加库存）并入账：账面 +100
+curl -X POST localhost:8000/inventory-docs -H 'X-Tenant: acme' -H 'Content-Type: application/json' \
+  -d '{"doc_id":"D-1","warehouse_id":"W-1","item_id":"SKU-1","direction":"inbound","quantity":100,"request_id":"d-acc-1"}'
+curl -X POST localhost:8000/inventory-docs/D-1/post -H 'X-Tenant: acme' -H 'Content-Type: application/json' -d '{"request_id":"d-post-1"}'
+# 受理出库单：立即占用可用数量（可用 100 → 60）
+curl -X POST localhost:8000/inventory-docs -H 'X-Tenant: acme' -H 'Content-Type: application/json' \
+  -d '{"doc_id":"D-2","warehouse_id":"W-1","item_id":"SKU-1","direction":"outbound","quantity":40,"request_id":"d-acc-2"}'
+# 入账出库：占用转为账面扣减（账面 60，占用 0）
+curl -X POST localhost:8000/inventory-docs/D-2/post -H 'X-Tenant: acme' -H 'Content-Type: application/json' -d '{"request_id":"d-post-2"}'
+# 冲正出库：数量加回账面（账面回到 100）
+curl -X POST localhost:8000/inventory-docs/D-2/reverse -H 'X-Tenant: acme' -H 'Content-Type: application/json' -d '{"request_id":"d-rv-2"}'
+# 按单号读取单据、按仓库与商品读取余额
+curl localhost:8000/inventory-docs/D-1 -H 'X-Tenant: acme'
+curl 'localhost:8000/inventory-balance?warehouse_id=W-1&item_id=SKU-1' -H 'X-Tenant: acme'
+```
+
+## 数据与配置
 - 数据库文件默认 `var/app.sqlite`（不入库）。
 - 环境变量：`APP_DB`（数据库路径）、`APP_PORT`（监听端口）、`APP_TENANT_HEADER`（默认 `X-Tenant`）。
 
@@ -209,4 +252,4 @@ curl 'localhost:8000/reconciliations?status=pending&min_amount_cents=100&max_amo
 - 单进程运行，单库写入，未做连接池与写并发调优。
 - 租户通过请求头声明，未接入真实身份提供方。
 - 无缓存层；退款单批量导入为单事务同步处理，适合中小批次。
-- 收款只支持整单登记，未实现分期；结算单支持受理、核销、撤销与冲正，收款与结算单共同受未收余额守恒约束；退款单支持受理、完成、撤销与冲正，退款单金额仅可经由已解决工单的裁决扣减与其撤销加回调整；对账单支持受理、核销、撤销与冲正，只在退款单未核销余额内占用/核销/减回，不改动订单与退款单金额。
+- 收款只支持整单登记，未实现分期；结算单支持受理、核销、撤销与冲正，收款与结算单共同受未收余额守恒约束；退款单支持受理、完成、撤销与冲正，退款单金额仅可经由已解决工单的裁决扣减与其撤销加回调整；对账单支持受理、核销、撤销与冲正，只在退款单未核销余额内占用/核销/减回，不改动订单与退款单金额；出入库单支持受理、入账、撤销与冲正，余额按单据流水推导，可用数量守恒（账面 − 待入账出库占用 ≥ 0）。
