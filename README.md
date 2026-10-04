@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额；以及退款单的受理、状态推进（完成/撤销）与冲正，内建请求级幂等与可退余额守恒；另支持针对退款单的工单争议链路：受理、逐级推进、裁决扣减与撤销关闭；并支持针对订单的结算单对账核销链路：受理占用未收余额、核销计入已收、撤销释放与冲正加回，含条件检索；以及针对退款单的对账单对账核销链路：受理占用未核销余额、核销计入已核销、撤销释放与冲正减回，含条件检索且全程不改动订单与退款单金额；另支持退款单批量导入：逐行校验、部分成功、错误清单、批次幂等与断点续跑，与逐单受理共用同一套可退余额守恒与租户隔离规则。数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额；以及退款单的受理、状态推进（完成/撤销）与冲正，内建请求级幂等与可退余额守恒；另支持针对退款单的工单争议链路：受理、逐级推进、裁决扣减与撤销关闭；并支持针对订单的结算单对账核销链路：受理占用未收余额、核销计入已收、撤销释放与冲正加回，含条件检索；以及针对退款单的对账单对账核销链路：受理占用未核销余额、核销计入已核销、撤销释放与冲正减回，含条件检索且全程不改动订单与退款单金额；另支持退款单批量导入：逐行校验、部分成功、错误清单、批次幂等与断点续跑，与逐单受理共用同一套可退余额守恒与租户隔离规则；另支持按租户隔离的出入库单与库存余额：受理、入账、撤销、冲正、按单号读取与按仓库商品读取余额，待入账出库即占用可用数量，可用 = 账面 − 占用且不为负。数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -199,6 +199,48 @@ curl localhost:8000$B -H 'X-Tenant: acme'
 curl 'localhost:8000/reconciliations?status=pending&min_amount_cents=100&max_amount_cents=500' -H 'X-Tenant: acme'
 ```
 
+## 出入库单与库存余额
+
+租户均经请求头 `X-Tenant` 传入（缺租户头返回 400）；写操作请求体携带 `request_id`（每次业务操作唯一），同一租户内相同标识且操作、对象、参数完全相同的重放返回首次业务结果（含业务拒绝），不重复占用或改动库存；同一标识改作其他用途返回 409。单号识别单据，请求标识只识别一次操作。
+
+出入库单以（租户， 单号）唯一，记载仓库标识、商品标识、方向（`in` 入库 / `out` 出库）与正整数数量；不预设商品目录与期初库存，未发生入库的余额为零。跨租户读取或操作已有单据一律按不存在（404）处理。
+
+状态机：`pending → posted → reversed`，`pending → cancelled`；已撤销与已冲正为终态，不可再变更，非法推进一律 409 且不改单据与余额。受理后为待入账：待入账入库单不增加库存；待入账出库单受理即占用可用数量，超出可用（账面 − 占用）的受理拒绝。只有待入账单可入账或撤销：入账时入库增加账面数量、出库把占用转为账面扣减；撤销释放出库占用、不改账面数量。已入账单只能冲正一次，消除原入账效果：冲正入库单把数量从账面扣回，若会使账面低于待入账出库占用则拒绝且保持原状态；冲正出库单把数量加回账面。
+
+余额不变量：可用 = 账面 − 占用，三者均不为负；竞争同一可用库存的并发请求中只有可用量内的请求成功，绝不出现负库存。成功时单据、余额与请求结果在同一事务原子落库；业务拒绝只保留可重放的结果；重启后单据状态、占用与请求结果仍可读取。
+
+- `POST /stock-documents`：受理出入库单。请求字段 `doc_no`、`warehouse_id`、`item_id`（均非空）、`direction`（`in`/`out`）、`quantity`（正整数）、`request_id`。成功返回 201 与单据（`status=pending`）及当前 `balance`；参数不合法返回 422；同一租户单号重复返回 409（`stock document already accepted`）；出库数量超过可用返回 409（`insufficient available stock`）。
+- `POST /stock-documents/{doc_no}/post`：入账。请求字段 `request_id`。仅待入账单可入账；成功 200 并返回单据与最新 `balance`。
+- `POST /stock-documents/{doc_no}/cancel`：撤销（终态）。仅待入账单可撤销；释放出库占用、不改账面数量。
+- `POST /stock-documents/{doc_no}/reverse`：对已入账单冲正一次（终态）。冲正入库单若会使账面低于待入账出库占用返回 409（`reversal would drive book stock below occupied quantity`）且保持原状态。
+- `GET /stock-documents/{doc_no}`：按单号读取单据；跨租户或不存在返回 404。
+- `GET /stock-balance?warehouse_id=&item_id=`：按仓库与商品读取余额，返回 `book_qty`（账面数量）、`occupied_qty`（待入账出库占用）、`available_qty`（可用数量）；未发生入库的组合返回全零；缺参数返回 400。
+
+单据对象字段：`doc_no`、`warehouse_id`、`item_id`、`direction`、`quantity`、`status`；写操作响应另附 `balance`（`book_qty`、`occupied_qty`、`available_qty`）。
+
+### 调用示例
+
+```bash
+# 受理入库单（待入账，不增加库存）
+curl -X POST localhost:8000/stock-documents -H 'X-Tenant: acme' -H 'Content-Type: application/json' \
+  -d '{"doc_no":"IN-1","warehouse_id":"W1","item_id":"SKU1","direction":"in","quantity":100,"request_id":"k-acc-1"}'
+# 入账：账面 +100
+curl -X POST localhost:8000/stock-documents/IN-1/post -H 'X-Tenant: acme' -H 'Content-Type: application/json' \
+  -d '{"request_id":"k-post-1"}'
+# 受理出库单 30：立即占用可用数量（可用 100 -> 70）
+curl -X POST localhost:8000/stock-documents -H 'X-Tenant: acme' -H 'Content-Type: application/json' \
+  -d '{"doc_no":"OUT-1","warehouse_id":"W1","item_id":"SKU1","direction":"out","quantity":30,"request_id":"k-acc-2"}'
+# 入账：占用转为账面扣减（账面 70、占用 0、可用 70）
+curl -X POST localhost:8000/stock-documents/OUT-1/post -H 'X-Tenant: acme' -H 'Content-Type: application/json' \
+  -d '{"request_id":"k-post-2"}'
+# 冲正出库单：数量加回账面（只能冲正一次）
+curl -X POST localhost:8000/stock-documents/OUT-1/reverse -H 'X-Tenant: acme' -H 'Content-Type: application/json' \
+  -d '{"request_id":"k-rv-1"}'
+# 按单号读取单据、按仓库与商品读取余额
+curl localhost:8000/stock-documents/OUT-1 -H 'X-Tenant: acme'
+curl 'localhost:8000/stock-balance?warehouse_id=W1&item_id=SKU1' -H 'X-Tenant: acme'
+```
+
 ## 数据与配置
 
 - 数据库文件默认 `var/app.sqlite`（不入库）。
@@ -209,4 +251,4 @@ curl 'localhost:8000/reconciliations?status=pending&min_amount_cents=100&max_amo
 - 单进程运行，单库写入，未做连接池与写并发调优。
 - 租户通过请求头声明，未接入真实身份提供方。
 - 无缓存层；退款单批量导入为单事务同步处理，适合中小批次。
-- 收款只支持整单登记，未实现分期；结算单支持受理、核销、撤销与冲正，收款与结算单共同受未收余额守恒约束；退款单支持受理、完成、撤销与冲正，退款单金额仅可经由已解决工单的裁决扣减与其撤销加回调整；对账单支持受理、核销、撤销与冲正，只在退款单未核销余额内占用/核销/减回，不改动订单与退款单金额。
+- 收款只支持整单登记，未实现分期；结算单支持受理、核销、撤销与冲正，收款与结算单共同受未收余额守恒约束；退款单支持受理、完成、撤销与冲正，退款单金额仅可经由已解决工单的裁决扣减与其撤销加回调整；对账单支持受理、核销、撤销与冲正，只在退款单未核销余额内占用/核销/减回，不改动订单与退款单金额；出入库单支持受理、入账、撤销与冲正，不预设商品目录与期初库存，库存余额按（租户, 仓库, 商品）维护。

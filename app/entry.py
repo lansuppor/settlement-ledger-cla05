@@ -1,17 +1,18 @@
 import argparse
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import orders, reconciliations, refund_imports, refunds, settlements, tickets
+from app.store import orders, reconciliations, refund_imports, refunds, settlements, stock, tickets
 from app.store.db import connect, migrate
 from app.store.reconciliations import ReconciliationConflict
 from app.store.refund_imports import RefundImportConflict
 from app.store.refunds import RefundConflict
 from app.store.settlements import SettlementConflict
+from app.store.stock import StockConflict
 from app.store.tickets import TicketConflict
 
 app = FastAPI(title="settlement-ledger")
@@ -34,6 +35,10 @@ def reconciliation_conflict_handler(_request: Request, exc: ReconciliationConfli
 
 @app.exception_handler(RefundImportConflict)
 def refund_import_conflict_handler(_request: Request, exc: RefundImportConflict) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+@app.exception_handler(StockConflict)
+def stock_conflict_handler(_request: Request, exc: StockConflict) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 class OrderIn(BaseModel):
@@ -88,6 +93,17 @@ class SettlementIn(BaseModel):
     request_id: str = Field(min_length=1)
 
 class SettlementActionIn(BaseModel):
+    request_id: str = Field(min_length=1)
+
+class StockDocumentIn(BaseModel):
+    doc_no: str = Field(min_length=1)
+    warehouse_id: str = Field(min_length=1)
+    item_id: str = Field(min_length=1)
+    direction: Literal["in", "out"]
+    quantity: int = Field(gt=0)
+    request_id: str = Field(min_length=1)
+
+class StockActionIn(BaseModel):
     request_id: str = Field(min_length=1)
 
 def _require_tenant(x_tenant: str) -> str:
@@ -389,6 +405,50 @@ def search_settlements(status: str = "", min_amount_cents: int | None = None,
         max_amount_cents=max_amount_cents,
     )
     return {"settlements": items}
+
+# ---- 出入库单与库存余额 ----
+
+@app.post("/stock-documents", status_code=201)
+def accept_stock_document(body: StockDocumentIn, x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    status, payload = stock.accept(
+        tenant, body.doc_no, body.warehouse_id, body.item_id,
+        body.direction, body.quantity, body.request_id)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.post("/stock-documents/{doc_no}/post")
+def post_stock_document(doc_no: str, body: StockActionIn, x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    status, payload = stock.post(tenant, doc_no, body.request_id)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.post("/stock-documents/{doc_no}/cancel")
+def cancel_stock_document(doc_no: str, body: StockActionIn, x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    status, payload = stock.cancel(tenant, doc_no, body.request_id)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.post("/stock-documents/{doc_no}/reverse")
+def reverse_stock_document(doc_no: str, body: StockActionIn, x_tenant: str = Header(default="")):
+    tenant = _require_tenant(x_tenant)
+    status, payload = stock.reverse(tenant, doc_no, body.request_id)
+    return JSONResponse(status_code=status, content=payload)
+
+@app.get("/stock-documents/{doc_no}")
+def read_stock_document(doc_no: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    document = stock.get(tenant, doc_no)
+    if document is None:
+        raise HTTPException(status_code=404, detail="stock document not found")
+    return document
+
+@app.get("/stock-balance")
+def read_stock_balance(warehouse_id: str = "", item_id: str = "",
+                       x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    if not warehouse_id or not item_id:
+        raise HTTPException(status_code=400, detail="warehouse_id and item_id are required")
+    return stock.balance(tenant, warehouse_id, item_id)
 
 def main() -> None:
     parser = argparse.ArgumentParser()
